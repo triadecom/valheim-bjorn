@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>VikingCompanion</AssemblyName>
+    <RootNamespace>VikingCompanion</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>none</DebugType>
+    <!-- Конфликты версий System.Net.Http и др. между SDK и игрой: берутся сборки игры -->
+    <NoWarn>$(NoWarn);MSB3277;CS0649</NoWarn>
+  </PropertyGroup>
+
+  <!-- Свой путь к игре — в local.props в корне репозитория (не в git), см. local.props.example,
+       или через dotnet build -p:ValheimDir=... -->
+  <Import Project="$(MSBuildThisFileDirectory)../local.props" Condition="Exists('$(MSBuildThisFileDirectory)../local.props')" />
+
+  <PropertyGroup>
+    <!-- По умолчанию — обычная установка Steam на macOS: там лежат valheim.app и BepInEx -->
+    <ValheimDir Condition="'$(ValheimDir)' == ''">$(HOME)/Library/Application Support/Steam/steamapps/common/Valheim</ValheimDir>
+    <ManagedDir>$(ValheimDir)/valheim.app/Contents/Resources/Data/Managed</ManagedDir>
+    <BepInExDir>$(ValheimDir)/BepInEx</BepInExDir>
+    <!-- Установка DLL в игру после сборки; -p:Deploy=false — только собрать (например, пока игра запущена) -->
+    <Deploy Condition="'$(Deploy)' == ''">true</Deploy>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Мод сам запускает мост из этого репозитория: путь к CompanionBridge зашивается при сборке -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BridgeDir</_Parameter1>
+      <_Parameter2>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../CompanionBridge'))</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Открывает приватные поля игры для компиляции (ИИ мобов почти весь private/protected) -->
+    <PackageReference Include="BepInEx.AssemblyPublicizer.MSBuild" Version="0.4.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="assembly_valheim" HintPath="$(ManagedDir)/assembly_valheim.dll" Private="false" Publicize="true" />
+    <Reference Include="assembly_utils" HintPath="$(ManagedDir)/assembly_utils.dll" Private="false" Publicize="true" />
+    <Reference Include="assembly_guiutils" HintPath="$(ManagedDir)/assembly_guiutils.dll" Private="false" Publicize="true" />
+    <Reference Include="Splatform" HintPath="$(ManagedDir)/Splatform.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(ManagedDir)/UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(ManagedDir)/UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.PhysicsModule" HintPath="$(ManagedDir)/UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="UnityEngine.AnimationModule" HintPath="$(ManagedDir)/UnityEngine.AnimationModule.dll" Private="false" />
+    <Reference Include="Unity.TextMeshPro" HintPath="$(ManagedDir)/Unity.TextMeshPro.dll" Private="false" />
+    <Reference Include="UnityEngine.UI" HintPath="$(ManagedDir)/UnityEngine.UI.dll" Private="false" />
+    <Reference Include="UnityEngine.UIModule" HintPath="$(ManagedDir)/UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="UnityEngine.TextRenderingModule" HintPath="$(ManagedDir)/UnityEngine.TextRenderingModule.dll" Private="false" />
+    <Reference Include="UnityEngine.InputLegacyModule" HintPath="$(ManagedDir)/UnityEngine.InputLegacyModule.dll" Private="false" />
+    <Reference Include="UnityEngine.JSONSerializeModule" HintPath="$(ManagedDir)/UnityEngine.JSONSerializeModule.dll" Private="false" />
+    <Reference Include="BepInEx" HintPath="$(BepInExDir)/core/BepInEx.dll" Private="false" />
+    <Reference Include="0Harmony" HintPath="$(BepInExDir)/core/0Harmony.dll" Private="false" />
+  </ItemGroup>
+
+  <!-- После сборки кладём DLL прямо в плагины игры -->
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="'$(Deploy)' == 'true'">
+    <MakeDir Directories="$(BepInExDir)/plugins/VikingCompanion" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BepInExDir)/plugins/VikingCompanion" />
+  </Target>
+
+</Project>

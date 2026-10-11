@@ -1,0 +1,13 @@
+# Мост компаньона: macOS на Apple Silicon, Python 3.12 (arm64)
+anthropic==1.13.0
+pydantic==2.14.0
+numpy==2.5.4
+sounddevice==0.5.6
+
+# Распознавание речи: Parakeet на MLX
+mlx==0.32.3
+parakeet-mlx==0.5.3
+
+# Голос: Silero (через torch) и запасной Piper
+torch==2.14.1
+piper-tts==1.8.0

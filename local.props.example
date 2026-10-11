@@ -1,0 +1,6 @@
+<Project>
+  <!-- Скопируй в local.props и укажи папку, где лежат valheim.app и BepInEx -->
+  <PropertyGroup>
+    <ValheimDir>$(HOME)/Library/Application Support/Steam/steamapps/common/Valheim</ValheimDir>
+  </PropertyGroup>
+</Project>
