@@ -7,9 +7,11 @@
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -49,9 +51,11 @@ THINKING = {
 MEMORY_MODEL = "claude-haiku-5-5"
 
 ACTIONS = ["follow", "stay", "come", "attack", "gather_wood", "mine", "pick", "hunt", "loot",
-           "give_items", "store", "fetch", "combat_style"]
+           "give_items", "store", "fetch", "combat_style",
+           "mark_place", "forget_place", "guard", "repair", "smelt", "collect"]
 ActionName = Literal["follow", "stay", "come", "attack", "gather_wood", "mine", "pick", "hunt", "loot",
-                     "give_items", "store", "fetch", "combat_style"]
+                     "give_items", "store", "fetch", "combat_style",
+                     "mark_place", "forget_place", "guard", "repair", "smelt", "collect"]
 
 OUTPUT_SCHEMA = {
     "type": "object",
@@ -69,6 +73,9 @@ OUTPUT_SCHEMA = {
                     "do": {"type": "string", "enum": ACTIONS},
                     "what": {"type": "string", "description": "Что именно; пустая строка — не важно."},
                     "count": {"type": "integer", "description": "Сколько; 0 — на твоё усмотрение."},
+                    "kind": {"type": "string", "enum": ["home", "portal", "resource", "danger", "landmark"],
+                             "description": "Только для mark_place: что это за место."},
+                    "note": {"type": "string", "description": "Только для mark_place: что игрок сказал об этом месте."},
                 },
                 "required": ["do", "what", "count"],
                 "additionalProperties": False,
@@ -90,6 +97,8 @@ class Step(BaseModel):
     do: ActionName
     what: str = ""
     count: int = 0
+    kind: str = ""
+    note: str = ""
 
 
 class Reply(BaseModel):
@@ -181,11 +190,11 @@ def _near_list(items: list | None, unit: str = "") -> str:
 
 
 def render_state(state: dict, name: str) -> str:
-    player = state.get("player_name") or "побратим"
+    player = state.get("player_name") or "игрок"
     lines = [
         f"День {state.get('day', '?')}, {state.get('time_of_day', '?')}, погода: {state.get('weather') or 'обычная'}.",
         f"Земли: {state.get('biome') or 'неизвестно'}{'; ' + state['location'] if state.get('location') else ''}."
-        + (f" Дом побратима (кровать): {state['home']}." if state.get("home") else ""),
+        + (f" Дом игрока (кровать): {state['home']}." if state.get("home") else ""),
         (
             f"{player}: здоровье {state.get('player_hp', 0):.0f}/{state.get('player_hp_max', 0):.0f}, "
             f"груз {state.get('player_weight', 0):.0f}/{state.get('player_weight_max', 0):.0f}, "
@@ -229,6 +238,34 @@ def render_state(state: dict, name: str) -> str:
                          f"(занято ячеек {ch.get('used', 0)} из {ch.get('total', 0)}).")
     else:
         lines.append("Сундука Бьёрна поблизости нет.")
+    furnaces = state.get("furnaces") or []
+    for f in furnaces[:6]:
+        fuel = f" топливо ({f.get('fuel_item')}) {f.get('fuel', 0)}/{f.get('fuel_max', 0)}," if f.get("fuel_max") else ""
+        ready = f" готово к выдаче {f.get('ready')}," if f.get("ready") else ""
+        lines.append(f"Печь «{f.get('name')}» в {f.get('distance', 0):.0f} м {f.get('where', '')}:{fuel}{ready} "
+                     f"в очереди {f.get('queued', 0)}/{f.get('queue_max', 0)} (принимает: {f.get('inputs') or '?'}).")
+    if state.get("damaged_near"):
+        lines.append(f"Повреждённых построек рядом: {state['damaged_near']}.")
+    places = state.get("places") or []
+    if places:
+        parts = []
+        for p in places[:12]:
+            where = "вы здесь" if p.get("here") else f"{p.get('distance', 0):.0f} м {p.get('where', '')}"
+            text = f"«{p.get('name')}» ({p.get('kind')}, {where})"
+            if p.get("note"):
+                text += f" — {p['note']}"
+            if p.get("about") and (p.get("here") or p.get("kind") == "база"):
+                text += f" [{p['about']}]"
+            parts.append(text)
+        lines.append("Места, что ты знаешь: " + "; ".join(parts) + ".")
+    else:
+        lines.append("Мест ты пока не запоминал.")
+    pins = state.get("pins") or []
+    if pins:
+        lines.append("Метки игрока на карте: " + ", ".join(
+            f"«{p.get('name')}» ({p.get('nearest', 0):.0f} м {p.get('where', '')})" for p in pins[:8]) + ".")
+    if state.get("guarding"):
+        lines.append(f"Ты сейчас сторожишь «{state['guarding']}».")
     return "\n".join(lines)
 
 
@@ -241,6 +278,18 @@ def read_prompt(name: str) -> str:
 
 ROLES = ["viking", "skald", "mentor", "jester", "friend", "custom"]
 
+
+def role_title(role: str) -> str:
+    text = (PROMPTS_DIR / f"roles/{role}.md").read_text(encoding="utf-8")
+    m = re.search(r"^title:\s*(.+)$", text, re.M)
+    return m.group(1).strip() if m else role
+
+
+def role_signature(cfg: "Settings") -> str:
+    """Что меняет голос персонажа: роль, своя роль и имя."""
+    custom = " ".join(cfg.role_custom.split())
+    return f"{cfg.role}|{cfg.name}|{hashlib.sha1(custom.encode()).hexdigest()[:8]}"
+
 LENGTH = {
     "short": "Говори коротко: одна-две фразы, обычно до 20 слов. Это слова в пути и в бою, а не сага.",
     "normal": "Говори коротко, но не односложно: две-три фразы, до 40 слов.",
@@ -250,7 +299,7 @@ LENGTH = {
 CHATTINESS = {
     "quiet": "Ты молчалив. На события откликайся, только если это действительно важно: опасность, рана, итог дела. Иначе say — пустая строка.",
     "normal": "",
-    "chatty": "Ты разговорчив: охотно откликаешься на события, вспоминаешь былое, сам расспрашиваешь побратима о планах.",
+    "chatty": "Ты разговорчив: охотно откликаешься на события, вспоминаешь былое, сам расспрашиваешь игрока о планах.",
 }
 
 
@@ -265,11 +314,11 @@ def scale(value: int, low: str, mid: str, high: str, top: str) -> str:
 
 
 def build_style(cfg: Settings) -> str:
-    lines = ["# Манера (настроил побратим)", LENGTH.get(cfg.length, LENGTH["short"])]
+    lines = ["# Манера (настроил игрок)", LENGTH.get(cfg.length, LENGTH["short"])]
     lines.append(scale(cfg.humor, "Шутишь редко, держишься серьёзно.", "Шутишь иногда, к месту.",
                        "Шутишь часто.", "Шутишь постоянно, балагуришь при любом случае."))
     lines.append(scale(cfg.rudeness, "Говоришь мягко и по-доброму, без грубостей.", "Прям и порой резковат, но не груб.",
-                       "Грубоват и дерзок, любишь поддеть побратима.",
+                       "Грубоват и дерзок, любишь поддеть игрока.",
                        "Груб и язвителен на словах (но без мата), хотя в деле верен до конца."))
     if CHATTINESS.get(cfg.chattiness):
         lines.append(CHATTINESS[cfg.chattiness])
@@ -281,7 +330,7 @@ def build_system(cfg: Settings) -> str:
     parts = [read_prompt(f"roles/{role}.md")]
     custom = " ".join(cfg.role_custom.split())[:1500]
     if custom:
-        parts.append("# Каким тебя хочет видеть побратим\n" + custom
+        parts.append("# Каким тебя хочет видеть игрок\n" + custom
                      + "\nЭто описание важнее общих слов о характере выше, если они расходятся.")
     parts += [build_style(cfg), read_prompt("rules.md"), read_prompt("lore.md")]
     return "\n\n".join(parts).replace("{name}", cfg.name)
@@ -295,6 +344,10 @@ def plan_text(plan: list[Step]) -> str:
             item += f" «{step.what}»"
         if step.count:
             item += f" ×{step.count}"
+        if step.kind:
+            item += f" [{step.kind}]"
+        if step.note:
+            item += f" ({step.note})"
         out.append(item)
     return ", ".join(out)
 
@@ -374,7 +427,10 @@ class Brain:
     def respond(self, kind: str, text: str, state: dict, speak: bool = True, commit: bool = True) -> Reply:
         """Спрашивает Claude потоком; законченные предложения сразу уходят в речь."""
         self._select_memory(state)
-        player = state.get("player_name") or "Побратим"
+        with self.lock:
+            cfg = self.cfg
+        self.memory.mark_role(role_signature(cfg), role_title(cfg.role if cfg.role in ROLES else "viking"))
+        player = state.get("player_name") or "Игрок"
         incoming, _ = self._incoming(kind, text, player)
         if LOG_STATE:
             log.info("state for %s: %s", kind, json.dumps(state, ensure_ascii=False))
@@ -433,7 +489,7 @@ class Brain:
 
     def commit(self, kind: str, text: str, state: dict, reply: Reply) -> None:
         self._select_memory(state)
-        _, history_line = self._incoming(kind, text, state.get("player_name") or "Побратим")
+        _, history_line = self._incoming(kind, text, state.get("player_name") or "Игрок")
         lines = [history_line]
         if reply.say:
             lines.append(f"{self.name}: {reply.say}")

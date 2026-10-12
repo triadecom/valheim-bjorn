@@ -236,6 +236,10 @@ namespace VikingCompanion
             {
                 names = new HashSet<string>(s_berries.Concat(s_herbs).Concat(PrefabsOfKind(PickKind.Mushroom)));
             }
+            else if (Has(what, "слитк", "слиток", "bar", "металл"))
+            {
+                names = new HashSet<string> { "Copper", "Tin", "Bronze", "Iron", "Silver", "BlackMetal", "Flametal", "FlametalNew" };
+            }
             else if (Has(what, "дров", "дерев", "wood") && !Has(what, "тонк", "хорош", "древн", "мертв", "железн"))
             {
                 names = new HashSet<string> { "Wood" };

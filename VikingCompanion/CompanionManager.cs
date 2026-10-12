@@ -14,7 +14,12 @@ namespace VikingCompanion
         private static bool s_returning;
         private static bool s_parked;
 
-        public static bool IsParked => s_parked;
+        public static bool IsParked => s_parked || GuardParked;
+        // Ушёл сторожить место (например, базу) и ждёт там, пока игрок не придёт
+        private static bool GuardParked => Companion.Local == null && Places.Guard.Length > 0;
+        private static string s_pendingGuard;
+        private static float s_spawnedAt = -999f;
+        private static float s_guardLogAt;
         private static Heightmap.Biome s_lastBiome = Heightmap.Biome.None;
         private static int s_lastDayPhase = -1;
         private static float s_lastComment = -999f;
@@ -63,6 +68,32 @@ namespace VikingCompanion
                     return;
                 }
                 s_parked = false;
+                // Только что появился — Start ещё не прошёл, второго не нужно
+                if (Time.time - s_spawnedAt < 3f)
+                {
+                    return;
+                }
+                // Сторожит место (базу): ждёт там и появляется, когда игрок пришёл
+                if (Places.Guard.Length > 0)
+                {
+                    Place place = Places.Find(Places.Guard, exact: true);
+                    if (place != null)
+                    {
+                        float away = Utils.DistanceXZ(player.transform.position, place.Position);
+                        if (away > 60f || player.IsTeleporting())
+                        {
+                            if (Plugin.DebugLog.Value && Time.time > s_guardLogAt)
+                            {
+                                s_guardLogAt = Time.time + 5f;
+                                Plugin.Log.LogInfo($"[debug] ждёт на «{place.name}»: игрок в {away:0} м, телепорт={player.IsTeleporting()}");
+                            }
+                            return;
+                        }
+                        SpawnAtGuard(player, place);
+                        return;
+                    }
+                    Places.Guard = "";
+                }
                 if (!player.IsTeleporting())
                 {
                     Spawn(player);
@@ -81,8 +112,9 @@ namespace VikingCompanion
             }
             // Следом — держится рядом; на работе может уйти к лесу, но не дальше поводка
             float dist = Vector3.Distance(c.transform.position, player.transform.position);
-            bool working = c.CurrentMode != Companion.Mode.Follow && c.CurrentMode != Companion.Mode.Stay;
-            if (!player.IsTeleporting() && c.CurrentMode != Companion.Mode.Stay && dist > (working ? Companion.Leash + 10f : 50f))
+            bool working = c.CurrentMode != Companion.Mode.Follow && c.CurrentMode != Companion.Mode.Stay && c.CurrentMode != Companion.Mode.Guard;
+            if (!player.IsTeleporting() && c.CurrentMode != Companion.Mode.Stay && c.CurrentMode != Companion.Mode.Guard
+                && dist > (working ? Companion.Leash + 10f : 50f))
             {
                 if (working)
                 {
@@ -137,6 +169,7 @@ namespace VikingCompanion
                     ZDOMan.instance.DestroyZDO(old);
                 }
             }
+            s_spawnedAt = Time.time;
             GameObject go = Object.Instantiate(CompanionPrefab.Prefab, PlaceNear(player), player.transform.rotation);
             ZNetView nview = go.GetComponent<ZNetView>();
             s_zdo = nview.GetZDO() != null ? nview.GetZDO().m_uid : ZDOID.None;
@@ -150,13 +183,65 @@ namespace VikingCompanion
             if (s_returning)
             {
                 s_returning = false;
-                Comment(c, "Ты вернулся к побратиму после гибели в бою.", force: true);
+                Comment(c, "Ты вернулся к игроку после гибели в бою.", force: true);
             }
             else if (!s_greeted)
             {
                 s_greeted = true;
-                Comment(c, "Ты только что нагнал побратима — поприветствуй его.", force: true);
+                Comment(c, "Ты только что нагнал игрока — поприветствуй его.", force: true);
             }
+        }
+
+        // Пришёл на базу, которую он сторожит: он уже там
+        private static void SpawnAtGuard(Player player, Place place)
+        {
+            if (!s_zdo.IsNone())
+            {
+                ZDO old = ZDOMan.instance.GetZDO(s_zdo);
+                if (old != null)
+                {
+                    ZDOMan.instance.DestroyZDO(old);
+                }
+            }
+            Vector3 pos = place.Position;
+            if (ZoneSystem.instance.FindFloor(pos + Vector3.up * 3f, out float height))
+            {
+                pos.y = height + 0.1f;
+            }
+            s_pendingGuard = place.name;
+            s_spawnedAt = Time.time;
+            GameObject go = Object.Instantiate(CompanionPrefab.Prefab, pos, Quaternion.LookRotation(player.transform.position - pos));
+            ZNetView nview = go.GetComponent<ZNetView>();
+            s_zdo = nview.GetZDO() != null ? nview.GetZDO().m_uid : ZDOID.None;
+            s_greeted = true;
+            Plugin.Log.LogInfo($"Компаньон ждал на месте «{place.name}»");
+            Companion c = go.GetComponent<Companion>();
+            Comment(c, $"Игрок пришёл туда, где ты его ждал и сторожил: «{place.name}». Встреть его.", force: true);
+        }
+
+        public static bool TakePendingGuard(out string guard)
+        {
+            guard = s_pendingGuard;
+            s_pendingGuard = null;
+            return !string.IsNullOrEmpty(guard);
+        }
+
+        // Ушёл сторожить далёкое место: исчезает из виду и ждёт там игрока
+        public static void ParkAtGuard(Companion c)
+        {
+            string guard = Places.Guard;
+            Plugin.Log.LogInfo($"Компаньон ушёл сторожить «{guard}»");
+            ZNetScene.instance.Destroy(c.gameObject);
+            Places.Guard = guard;
+            s_zdo = ZDOID.None;
+        }
+
+        // Позвали издалека: прибегает к игроку и больше не сторожит
+        private static void CallBack(Player player)
+        {
+            s_parked = false;
+            Places.Guard = "";
+            Spawn(player, announce: false);
         }
 
         // Character.TeleportTo у не-игроков пустой, переносим тело сами
@@ -184,11 +269,22 @@ namespace VikingCompanion
         public static void OnCompanionUnloaded(Companion c)
         {
             s_parked = c.CurrentMode == Companion.Mode.Stay;
+            if (c.CurrentMode == Companion.Mode.Guard && Places.Guard.Length > 0)
+            {
+                // Сторожит базу: тело из выгруженной зоны не нужно — появится на базе, когда игрок придёт
+                ZNetView nview = c.GetComponent<ZNetView>();
+                if (nview != null && nview.GetZDO() != null)
+                {
+                    ZDOMan.instance.DestroyZDO(nview.GetZDO());
+                }
+                s_zdo = ZDOID.None;
+            }
         }
 
         public static void OnCompanionDied(Companion c)
         {
             s_respawnTimer = Plugin.RespawnSeconds.Value;
+            Places.Guard = "";
             s_returning = true;
             Character killer = c.Humanoid.m_lastHit != null ? c.Humanoid.m_lastHit.GetAttacker() : null;
             Note(killer != null ? $"{c.Name} пал в бою, его сразил {Localization.instance.Localize(killer.m_name)}" : $"{c.Name} пал");
@@ -212,7 +308,7 @@ namespace VikingCompanion
             }
             if (c == null)
             {
-                if (s_parked)
+                if (IsParked)
                 {
                     CallBackFromAfar(player, text);
                 }
@@ -235,6 +331,11 @@ namespace VikingCompanion
             });
         }
 
+        private static string AwayMode()
+        {
+            return GuardParked ? $"далеко, сторожит «{Places.Guard}» и ждёт там" : "далеко, сторожит место, куда его поставили";
+        }
+
         private static bool Comes(List<PlanStep> plan)
         {
             return plan.Count > 0 && (plan[0].Do == "follow" || plan[0].Do == "come");
@@ -244,15 +345,14 @@ namespace VikingCompanion
         private static void CallBackFromAfar(Player player, string text)
         {
             Bridge.GameState state = BuildState(player, null);
-            state.companion_mode = "далеко, сторожит место, куда его поставили";
+            state.companion_mode = AwayMode();
             Bridge.Send("chat", text, state, reply =>
             {
                 bool comes = Comes(reply.plan)
                     || (!string.IsNullOrEmpty(reply.error) && Regex.IsMatch(text, @"за мной|ко мне|сюда|иди|follow|come", RegexOptions.IgnoreCase));
                 if (comes && Player.m_localPlayer != null && Companion.Local == null)
                 {
-                    s_parked = false;
-                    Spawn(Player.m_localPlayer, announce: false);
+                    CallBack(Player.m_localPlayer);
                     Companion.Local?.Say(reply.say);
                 }
                 else if (!string.IsNullOrEmpty(reply.say) && Chat.instance != null)
@@ -270,9 +370,9 @@ namespace VikingCompanion
                 return new Bridge.GameState();
             }
             Bridge.GameState state = BuildState(player, Companion.Local);
-            if (Companion.Local == null && s_parked)
+            if (Companion.Local == null && IsParked)
             {
-                state.companion_mode = "далеко, сторожит место, куда его поставили";
+                state.companion_mode = AwayMode();
             }
             return state;
         }
@@ -293,10 +393,9 @@ namespace VikingCompanion
             Companion c = Companion.Local;
             if (c == null)
             {
-                if (s_parked && Comes(reply.plan))
+                if (IsParked && Comes(reply.plan))
                 {
-                    s_parked = false;
-                    Spawn(player, announce: false);
+                    CallBack(player);
                     Companion.Local?.Say(reply.say);
                 }
                 else if (!string.IsNullOrEmpty(reply.say) && Chat.instance != null)
@@ -312,17 +411,17 @@ namespace VikingCompanion
         public static void OnOrderByHand(Companion c)
         {
             Comment(c, c.CurrentMode == Companion.Mode.Stay
-                ? "Побратим жестом велел тебе ждать здесь."
-                : "Побратим жестом позвал тебя за собой.", force: true);
+                ? "Игрок жестом велел тебе ждать здесь."
+                : "Игрок жестом позвал тебя за собой.", force: true);
         }
 
-        // План выполнен: один отчёт модели обо всём сразу — она и расскажет побратиму
+        // План выполнен: один отчёт модели обо всём сразу — она и расскажет игроку
         public static void OnPlanFinished(Companion c, List<string> results)
         {
             string text = results.Count == 1
                 ? $"Ты закончил дело: {results[0]}."
                 : "Ты закончил всё, что поручили: " + string.Join("; ", results.Select((r, i) => $"{i + 1}) {r}")) + ".";
-            Comment(c, text + " Коротко скажи побратиму об итоге.", force: true);
+            Comment(c, text + " Коротко скажи игроку об итоге.", force: true);
         }
 
         private static void Apply(Companion c, List<PlanStep> plan, bool fromEvent = false)
@@ -331,8 +430,9 @@ namespace VikingCompanion
             {
                 return;
             }
-            // Реакция на событие (бой, ночь) не отменяет поручение побратима: от врагов он и так отобьётся
-            if (fromEvent && c.OnTask && plan.Any(s => s.Do != "combat_style"))
+            // Реакция на событие (бой, ночь) не отменяет поручение игрока: от врагов он и так отобьётся
+            bool holding = c.OnTask || c.CurrentMode == Companion.Mode.Guard || c.CurrentMode == Companion.Mode.Stay;
+            if (fromEvent && holding && plan.Any(s => s.Do != "combat_style"))
             {
                 Plugin.Log.LogInfo($"Действие по событию пропущено, занят делом: {string.Join(", ", plan)}");
                 plan = plan.Where(s => s.Do == "combat_style").ToList();
@@ -447,7 +547,7 @@ namespace VikingCompanion
             if (player.GetHealthPercentage() < 0.25f && Time.time - s_lastPlayerHurt > 90f)
             {
                 s_lastPlayerHurt = Time.time;
-                Comment(c, "Побратим тяжело ранен!", force: true);
+                Comment(c, "Игрок тяжело ранен!", force: true);
             }
 
             Heightmap.Biome biome = player.GetCurrentBiome();
@@ -457,11 +557,11 @@ namespace VikingCompanion
                 s_lastBiome = biome;
                 if (!first)
                 {
-                    Comment(c, $"Вы вошли в новые земли: {BiomeName(biome)}.");
+                    Comment(c, $"Вы вошли в новые земли: {WorldScan.BiomeName(biome)}.");
                 }
                 if (s_seenBiomes.Add(biome) && !first)
                 {
-                    Note($"вошли в земли: {BiomeName(biome)}");
+                    Note($"вошли в земли: {WorldScan.BiomeName(biome)}");
                 }
             }
 
@@ -490,7 +590,7 @@ namespace VikingCompanion
             if (Time.time > s_nextIdle && Proactive)
             {
                 Comment(c, Plugin.Chattiness.Value == "chatty"
-                    ? "Давно тихо, вы просто в пути. Скажи что-нибудь: вспомни былое, спроси побратима о планах или пошути."
+                    ? "Давно тихо, вы просто в пути. Скажи что-нибудь: вспомни былое, спроси игрока о планах или пошути."
                     : "Давно тихо, вы просто в пути. Можешь коротко что-нибудь сказать или промолчать.");
             }
         }
@@ -542,7 +642,7 @@ namespace VikingCompanion
             {
                 return;
             }
-            string text = "побратим " + string.Join(", ", s_build.Select(kv => kv.Value > 1 ? $"{kv.Key} ×{kv.Value}" : kv.Key));
+            string text = "игрок " + string.Join(", ", s_build.Select(kv => kv.Value > 1 ? $"{kv.Key} ×{kv.Value}" : kv.Key));
             s_build.Clear();
             Note(text);
         }
@@ -562,7 +662,7 @@ namespace VikingCompanion
         public static void OnPlayerDied(Player player)
         {
             Character killer = player.m_lastHit != null ? player.m_lastHit.GetAttacker() : null;
-            Note(killer != null ? $"побратим погиб, его убил {Localization.instance.Localize(killer.m_name)}" : "побратим погиб");
+            Note(killer != null ? $"игрок погиб, его убил {Localization.instance.Localize(killer.m_name)}" : "игрок погиб");
         }
 
         // ---------- Обстановка для LLM ----------
@@ -580,7 +680,7 @@ namespace VikingCompanion
                 player_hp_max = player.GetMaxHealth(),
                 player_weight = player.GetInventory().GetTotalWeight(),
                 player_weight_max = player.GetMaxCarryWeight(),
-                biome = BiomeName(player.GetCurrentBiome()),
+                biome = WorldScan.BiomeName(player.GetCurrentBiome()),
                 day = EnvMan.instance.GetDay(),
                 time_of_day = TimeOfDay(EnvMan.instance.GetDayFraction()),
                 weather = EnvMan.instance.GetCurrentEnvironment()?.m_name ?? "",
@@ -654,7 +754,99 @@ namespace VikingCompanion
                     total = inv.GetWidth() * inv.GetHeight(),
                 };
             }).ToArray();
+            AddPlaces(s, player);
             return s;
+        }
+
+        // Места, метки на карте, печи и поломки — чтобы знал, где что, и мог сам предложить дело
+        private static void AddPlaces(Bridge.GameState s, Player player)
+        {
+            Vector3 at = player.transform.position;
+            s.places = Places.All
+                .OrderBy(p => Utils.DistanceXZ(p.Position, at))
+                .Take(12)
+                .Select(p =>
+                {
+                    float dist = Utils.DistanceXZ(p.Position, at);
+                    return new Bridge.PlaceInfo
+                    {
+                        name = p.name,
+                        kind = Places.KindName(p.kind),
+                        distance = dist,
+                        where = WorldScan.Compass(at, p.Position),
+                        here = p.Contains(at),
+                        note = p.note,
+                        about = dist < 200f || p.kind == Places.Home ? p.about : "",
+                    };
+                }).ToArray();
+            s.pins = Places.PlayerPins()
+                .OrderBy(pin => Utils.DistanceXZ(pin.m_pos, at))
+                .Take(8)
+                .Select(pin => new Bridge.NearInfo
+                {
+                    name = pin.m_name,
+                    count = 1,
+                    nearest = Utils.DistanceXZ(pin.m_pos, at),
+                    where = WorldScan.Compass(at, pin.m_pos),
+                }).ToArray();
+            if (Companion.Local != null && Companion.Local.CurrentMode == Companion.Mode.Guard)
+            {
+                s.guarding = Places.Guard;
+            }
+
+            var pieces = new List<Piece>();
+            Piece.GetAllPiecesInRadius(at, 40f, pieces);
+            s.furnaces = pieces.Select(p => p != null ? p.GetComponent<Smelter>() : null)
+                .Where(f => f != null && f.m_nview != null && f.m_nview.IsValid())
+                .Distinct()
+                .OrderBy(f => Vector3.Distance(f.transform.position, at))
+                .Take(6)
+                .Select(f => new Bridge.FurnaceInfo
+                {
+                    name = Localization.instance.Localize(f.m_name),
+                    distance = Vector3.Distance(f.transform.position, at),
+                    where = WorldScan.Direction(player.transform, f.transform.position),
+                    fuel_item = f.m_fuelItem != null ? Localization.instance.Localize(f.m_fuelItem.m_itemData.m_shared.m_name) : "",
+                    fuel = Mathf.FloorToInt(f.GetFuel()),
+                    fuel_max = f.m_fuelItem != null ? f.m_maxFuel : 0,
+                    queued = f.GetQueueSize(),
+                    queue_max = f.m_maxOre,
+                    ready = f.GetProcessedQueueSize() + ReadyNear(f),
+                    inputs = string.Join(", ", f.m_conversion.Where(c => c.m_from != null).Take(5)
+                        .Select(c => Localization.instance.Localize(c.m_from.m_itemData.m_shared.m_name))),
+                }).ToArray();
+
+            foreach (WearNTear wnt in WearNTear.s_allInstances)
+            {
+                if (wnt != null && wnt.GetHealthPercentage() < 0.999f && Vector3.Distance(wnt.transform.position, at) < 35f)
+                {
+                    Piece piece = wnt.GetComponent<Piece>();
+                    if (piece != null && piece.IsPlacedByPlayer())
+                    {
+                        s.damaged_near++;
+                    }
+                }
+            }
+        }
+
+        // Сколько готового лежит у выхода печи
+        private static int ReadyNear(Smelter f)
+        {
+            if (f.m_outputPoint == null)
+            {
+                return 0;
+            }
+            var outputs = new HashSet<string>(f.m_conversion.Where(c => c.m_to != null).Select(c => c.m_to.gameObject.name));
+            int n = 0;
+            foreach (ItemDrop drop in ItemDrop.s_instances)
+            {
+                if (drop != null && drop.m_itemData.m_dropPrefab != null && outputs.Contains(drop.m_itemData.m_dropPrefab.name)
+                    && Vector3.Distance(drop.transform.position, f.m_outputPoint.position) < 4f)
+                {
+                    n += drop.m_itemData.m_stack;
+                }
+            }
+            return n;
         }
 
         private static Bridge.NearInfo Near(Player player, WorldScan.Group g)
@@ -668,7 +860,7 @@ namespace VikingCompanion
             };
         }
 
-        // Что у побратима в мешке (кроме надетого) — чтобы понимал, чего не хватает
+        // Что у игрока в мешке (кроме надетого) — чтобы понимал, чего не хватает
         private static string PlayerItems(Player player)
         {
             var groups = player.GetInventory().GetAllItems()
@@ -690,23 +882,6 @@ namespace VikingCompanion
             Vector3 home = profile.GetCustomSpawnPoint();
             float dist = Utils.DistanceXZ(home, player.transform.position);
             return dist < 15f ? "здесь, рядом" : $"в {dist:0} м {WorldScan.Direction(player.transform, home)}";
-        }
-
-        private static string BiomeName(Heightmap.Biome biome)
-        {
-            switch (biome)
-            {
-                case Heightmap.Biome.Meadows: return "Луга";
-                case Heightmap.Biome.BlackForest: return "Чёрный лес";
-                case Heightmap.Biome.Swamp: return "Болота";
-                case Heightmap.Biome.Mountain: return "Горы";
-                case Heightmap.Biome.Plains: return "Равнины";
-                case Heightmap.Biome.Mistlands: return "Туманные земли";
-                case Heightmap.Biome.AshLands: return "Пепельные земли";
-                case Heightmap.Biome.DeepNorth: return "Глубокий север";
-                case Heightmap.Biome.Ocean: return "Океан";
-                default: return biome.ToString();
-            }
         }
 
         private static string TimeOfDay(float fraction)

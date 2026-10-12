@@ -189,6 +189,82 @@ class SileroEngine:
         return (np.clip(audio, -1, 1) * 32767).astype(np.int16), self.RATE
 
 
+# ---------- Текст для синтеза ----------
+# Silero молча выбрасывает цифры и латиницу, а фраза без русских букв роняет его с «Text is empty».
+# Поэтому перед синтезом числа пишем словами, а имена вроде Xan — кириллицей.
+
+_ONES = ["ноль", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять", "десять",
+         "одиннадцать", "двенадцать", "тринадцать", "четырнадцать", "пятнадцать", "шестнадцать",
+         "семнадцать", "восемнадцать", "девятнадцать"]
+_TENS = ["", "", "двадцать", "тридцать", "сорок", "пятьдесят", "шестьдесят", "семьдесят", "восемьдесят", "девяносто"]
+_HUNDREDS = ["", "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот", "семьсот", "восемьсот", "девятьсот"]
+
+
+def _below_thousand(n: int, female: bool = False) -> list[str]:
+    words = []
+    if n >= 100:
+        words.append(_HUNDREDS[n // 100])
+        n %= 100
+    if n >= 20:
+        words.append(_TENS[n // 10])
+        n %= 10
+    if n or not words:
+        word = _ONES[n]
+        if female and n in (1, 2):
+            word = "одна" if n == 1 else "две"
+        if n or not words:
+            words.append(word)
+    return [w for w in words if w and not (w == "ноль" and len(words) > 1)]
+
+
+def number_words(n: int) -> str:
+    if n >= 1_000_000:
+        return " ".join(_ONES[int(d)] for d in str(n))
+    thousands, rest = divmod(n, 1000)
+    words = []
+    if thousands:
+        words += _below_thousand(thousands, female=True) if thousands > 1 else []
+        last = thousands % 100
+        words.append("тысяч" if 11 <= last <= 14 or thousands % 10 in (0, 5, 6, 7, 8, 9)
+                     else "тысяча" if thousands % 10 == 1 else "тысячи")
+    if rest or not thousands:
+        words += _below_thousand(rest)
+    return " ".join(words)
+
+
+_LATIN = [("sch", "ш"), ("sh", "ш"), ("ch", "ч"), ("th", "т"), ("ph", "ф"), ("kh", "х"), ("zh", "ж"),
+          ("ee", "и"), ("oo", "у"), ("ya", "я"), ("yu", "ю"), ("yo", "ё"), ("ck", "к"), ("qu", "кв"),
+          ("a", "а"), ("b", "б"), ("c", "к"), ("d", "д"), ("e", "е"), ("f", "ф"), ("g", "г"), ("h", "х"),
+          ("i", "и"), ("j", "дж"), ("k", "к"), ("l", "л"), ("m", "м"), ("n", "н"), ("o", "о"), ("p", "п"),
+          ("q", "к"), ("r", "р"), ("s", "с"), ("t", "т"), ("u", "у"), ("v", "в"), ("w", "в"), ("x", "кс"),
+          ("y", "и"), ("z", "з")]
+
+
+def _cyrillic(word: str) -> str:
+    low = word.lower()
+    out, i = [], 0
+    while i < len(low):
+        for lat, cyr in _LATIN:
+            if low.startswith(lat, i):
+                out.append(cyr)
+                i += len(lat)
+                break
+        else:
+            out.append(low[i])
+            i += 1
+    text = "".join(out)
+    return text[:1].upper() + text[1:] if word[:1].isupper() else text
+
+
+def speakable(text: str) -> str:
+    """Текст, который синтезатор произнесёт целиком; пустая строка — произносить нечего."""
+    text = text.replace("×", " ").replace("%", " процентов")
+    text = re.sub(r"\d+", lambda m: number_words(int(m.group())), text)
+    text = re.sub(r"[A-Za-z]+", lambda m: _cyrillic(m.group()), text)
+    text = " ".join(text.split())
+    return text if re.search(r"[А-Яа-яЁё]", text) else ""
+
+
 class Speaker:
     """Очередь фраз → синтез → воспроизведение. Прерывается мгновенно."""
 
@@ -221,7 +297,7 @@ class Speaker:
         return self.engine.synth(text)
 
     def say(self, text: str) -> None:
-        text = text.strip()
+        text = speakable(text)
         if text:
             self._queue.put((self._generation, text))
 
@@ -249,8 +325,13 @@ class Speaker:
             generation, item = self._queue.get()
             if generation != self._generation:
                 continue
-            audio, rate = self.synth(item) if isinstance(item, str) else item
             text = item if isinstance(item, str) else "(междометие)"
+            try:
+                audio, rate = self.synth(item) if isinstance(item, str) else item
+            except Exception:
+                # Одна неудачная фраза не должна оборвать голос до конца игры
+                log.exception("синтез не удался: %r", text)
+                continue
             if generation != self._generation or len(audio) == 0:
                 continue
             self._speaking = True

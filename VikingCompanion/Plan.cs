@@ -3,12 +3,14 @@ using System.Linq;
 
 namespace VikingCompanion
 {
-    // Шаг плана из ответа моста: {do, what, count}. План выполняется по порядку.
+    // Шаг плана из ответа моста: {do, what, count, kind?, note?}. План выполняется по порядку.
     public class PlanStep
     {
         public string Do = "";
         public string What = "";
         public int Count;
+        public string Kind = "";   // mark_place: база, портал, ресурсы, опасность
+        public string Note = "";   // mark_place: что сказал игрок о месте
 
         public PlanStep()
         {
@@ -22,7 +24,8 @@ namespace VikingCompanion
         }
 
         // Мгновенные шаги не ждут окончания дела: сразу идёт следующий
-        public bool Instant => Do == "follow" || Do == "come" || Do == "attack" || Do == "combat_style" || Do == "none";
+        public bool Instant => Do == "follow" || Do == "come" || Do == "attack" || Do == "combat_style" || Do == "none"
+            || Do == "mark_place" || Do == "forget_place";
 
         public override string ToString()
         {
@@ -47,7 +50,11 @@ namespace VikingCompanion
                 string action = Json.Str(step, "do");
                 if (action.Length > 0 && action != "none")
                 {
-                    plan.Add(new PlanStep(action, Json.Str(step, "what").Trim(), (int)Json.Num(step, "count")));
+                    plan.Add(new PlanStep(action, Json.Str(step, "what").Trim(), (int)Json.Num(step, "count"))
+                    {
+                        Kind = Json.Str(step, "kind").Trim(),
+                        Note = Json.Str(step, "note").Trim(),
+                    });
                 }
             }
             // Старый мост отвечал одним действием
@@ -75,7 +82,7 @@ namespace VikingCompanion
             switch (Do)
             {
                 case "follow":
-                case "come": return "идти за побратимом";
+                case "come": return "идти за игроком";
                 case "stay": return "сторожить место";
                 case "attack": return "напасть на врага";
                 case "gather_wood": return "рубить лес" + count;
@@ -83,10 +90,16 @@ namespace VikingCompanion
                 case "pick": return "собирать" + (what.Length > 0 ? what : " травы и ягоды") + count;
                 case "hunt": return "охотиться" + (what.Length > 0 ? " на" + what : "") + count;
                 case "loot": return "подбирать вещи";
-                case "give_items": return "отдать побратиму" + (what.Length > 0 ? what : " добычу");
+                case "give_items": return "отдать игроку" + (what.Length > 0 ? what : " добычу");
                 case "store": return "сложить в сундук" + what;
                 case "fetch": return "взять из сундука" + what + count;
                 case "combat_style": return What == "bow" ? "биться луком" : "биться топором";
+                case "mark_place": return "запомнить место" + what;
+                case "forget_place": return "забыть место" + what;
+                case "guard": return "сторожить" + (what.Length > 0 ? what : " место");
+                case "repair": return "чинить постройки" + (what.Length > 0 ? " —" + what : "");
+                case "smelt": return "загрузить печи" + what + count;
+                case "collect": return "забрать готовое из печей" + what;
                 default: return Do;
             }
         }

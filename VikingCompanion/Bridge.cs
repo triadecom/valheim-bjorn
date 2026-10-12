@@ -34,6 +34,31 @@ namespace VikingCompanion
         }
 
         [Serializable]
+        public class PlaceInfo
+        {
+            public string name;
+            public string kind;
+            public float distance;
+            public string where;
+            public bool here;
+            public string note;
+            public string about;
+        }
+
+        public class FurnaceInfo
+        {
+            public string name;
+            public float distance;
+            public string where;
+            public string fuel_item;
+            public int fuel;
+            public int fuel_max;
+            public int queued;
+            public int queue_max;
+            public int ready;
+            public string inputs;
+        }
+
         public class ChestInfo
         {
             public float distance;
@@ -78,6 +103,11 @@ namespace VikingCompanion
             public NearInfo[] plants;
             public NearInfo[] animals;
             public ChestInfo[] chests;
+            public PlaceInfo[] places;
+            public NearInfo[] pins;
+            public FurnaceInfo[] furnaces;
+            public int damaged_near;
+            public string guarding;
         }
 
         [Serializable]

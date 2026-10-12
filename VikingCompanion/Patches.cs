@@ -64,8 +64,16 @@ namespace VikingCompanion
                 return;
             }
             bool wanted = c.IsHunting || c.IsThreat(target);
-            bool leashed = Vector3.Distance(target.transform.position, player.transform.position) > Leash
-                && c.CurrentMode != Companion.Mode.Stay;
+            bool leashed = c.Guarding
+                ? Utils.DistanceXZ(target.transform.position, c.GuardCenter) > c.GuardRadius + 25f
+                : Vector3.Distance(target.transform.position, player.transform.position) > Leash && c.CurrentMode != Companion.Mode.Stay;
+            // В опасном месте («там тролль») сам драку не начинает — только если тварь уже идёт на них
+            if (wanted && !c.IsHunting && Places.DangerAt(target.transform.position) != null)
+            {
+                BaseAI ai = target.GetBaseAI();
+                Character theirs = ai != null ? ai.GetTargetCreature() : null;
+                wanted = theirs != null && (theirs == c.Humanoid || theirs.IsPlayer());
+            }
             if (!wanted || leashed)
             {
                 __instance.m_targetCreature = null;

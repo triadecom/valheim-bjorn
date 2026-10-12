@@ -38,6 +38,7 @@ namespace VikingCompanion
         internal static ConfigEntry<bool> Learn;
         internal static ConfigEntry<string> CombatStyle;
         internal static ConfigEntry<bool> DebugLog;
+        internal static ConfigEntry<bool> MapPins;
         internal static ConfigEntry<bool> VoiceEnabled;
         internal static ConfigEntry<KeyCode> VoiceKey;
         internal static ConfigEntry<bool> SuppressHide;
@@ -88,6 +89,7 @@ namespace VikingCompanion
             CombatStyle = Config.Bind("Companion", "CombatStyle", "melee", new ConfigDescription(
                 "Как биться: melee — топор и щит, bow — из лука издалека (вблизи всё равно топором). Меняется и приказом «стреляй из лука».",
                 new AcceptableValueList<string>("melee", "bow")));
+            MapPins = Config.Bind("Companion", "MapPins", true, "Ставить метку на карте, когда компаньон запоминает место.");
             Hair = Config.Bind("Look", "Hair", "Hair3", "Причёска (префаб Hair*).");
             Beard = Config.Bind("Look", "Beard", "Beard5", "Борода (префаб Beard*).");
             HairColor = Config.Bind("Look", "HairColor", "0.55,0.32,0.16", "Цвет волос RGB 0..1.");

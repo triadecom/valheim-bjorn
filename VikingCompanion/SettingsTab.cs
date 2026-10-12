@@ -322,11 +322,12 @@ namespace VikingCompanion
             }
             m_forgetArmedUntil = 0f;
             m_forgetLabel.text = "Забыть всё";
+            Places.Clear();
             Bridge.ForgetMemory(CompanionManager.CurrentState(), ok =>
             {
                 if (m_memoryText != null)
                 {
-                    m_memoryText.text = ok ? $"{Plugin.CompanionName.Value} всё забыл об этом мире." : "Не вышло: мост не отвечает.";
+                    m_memoryText.text = ok ? $"{Plugin.CompanionName.Value} всё забыл об этом мире, и места тоже." : "Не вышло: мост не отвечает.";
                 }
             });
         }

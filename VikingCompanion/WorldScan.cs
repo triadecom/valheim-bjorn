@@ -46,6 +46,7 @@ namespace VikingCompanion
             public Vector3 NearestRockPos;
             public List<Group> Plants;
             public List<Container> Chests;
+            public Dictionary<string, int> Ores;
         }
 
         private static Dictionary<int, PrefabInfo> s_prefabs;
@@ -135,7 +136,7 @@ namespace VikingCompanion
                 Vector3 pos = zdo.GetPosition();
                 float dist = Vector3.Distance(from, pos);
                 if (dist > radius || pos.y < water - 1f || Mathf.Abs(pos.y - from.y) > 20f
-                    || Vector3.Distance(keepNear, pos) > leash || skip.Contains(zdo.m_uid))
+                    || Vector3.Distance(keepNear, pos) > leash || skip.Contains(zdo.m_uid) || Places.DangerAt(pos) != null)
                 {
                     continue;
                 }
@@ -155,7 +156,7 @@ namespace VikingCompanion
             var s = new Survey
             {
                 NearestTree = float.MaxValue, NearestRock = float.MaxValue,
-                Plants = new List<Group>(), Chests = new List<Container>(),
+                Plants = new List<Group>(), Chests = new List<Container>(), Ores = new Dictionary<string, int>(),
             };
             if (!EnsureBuilt())
             {
@@ -200,6 +201,11 @@ namespace VikingCompanion
                 }
                 if (info.Kind == Kind.Rock)
                 {
+                    string ore = OreName(info.Name);
+                    if (ore != null)
+                    {
+                        s.Ores[ore] = (s.Ores.TryGetValue(ore, out int n) ? n : 0) + 1;
+                    }
                     if (info.Tier > pickaxeTier)
                     {
                         continue;
@@ -251,7 +257,8 @@ namespace VikingCompanion
                 Vector3 pos = zdo.GetPosition();
                 float dist = Vector3.Distance(from, pos);
                 if (dist > radius || dist >= best || pos.y < water - 0.5f || Mathf.Abs(pos.y - from.y) > 15f
-                    || Vector3.Distance(keepNear, pos) > leash || skip.Contains(zdo.m_uid) || zdo.GetBool(ZDOVars.s_picked))
+                    || Vector3.Distance(keepNear, pos) > leash || skip.Contains(zdo.m_uid) || zdo.GetBool(ZDOVars.s_picked)
+                    || Places.DangerAt(pos) != null)
                 {
                     continue;
                 }
@@ -278,7 +285,7 @@ namespace VikingCompanion
                 }
                 Vector3 pos = c.transform.position;
                 float dist = Vector3.Distance(from, pos);
-                if (dist >= bestDist || Vector3.Distance(keepNear, pos) > leash || skip.Contains(c.GetZDOID()))
+                if (dist >= bestDist || Vector3.Distance(keepNear, pos) > leash || skip.Contains(c.GetZDOID()) || Places.DangerAt(pos) != null)
                 {
                     continue;
                 }
@@ -324,11 +331,13 @@ namespace VikingCompanion
         }
 
         // Сундуки Бьёрна в загруженной округе, ближайший первым
-        public static Container FindChest(Vector3 from, Vector3 keepNear, float leash)
+        // Ближайший Сундук Бьёрна; если сундуков несколько — ближайший из тех, что подходят (prefer), иначе просто ближайший
+        public static Container FindChest(Vector3 from, Vector3 keepNear, float leash, System.Func<Container, bool> prefer = null,
+            ICollection<Container> skip = null)
         {
             int hash = BjornChest.PrefabHash;
-            Container best = null;
-            float bestDist = float.MaxValue;
+            Container best = null, bestPreferred = null;
+            float bestDist = float.MaxValue, bestPreferredDist = float.MaxValue;
             if (ZNetScene.instance == null)
             {
                 return null;
@@ -341,16 +350,134 @@ namespace VikingCompanion
                 }
                 Vector3 pos = kv.Key.GetPosition();
                 float dist = Vector3.Distance(from, pos);
-                if (dist < bestDist && Vector3.Distance(keepNear, pos) <= leash && kv.Value.TryGetComponent(out Container chest))
+                if (Vector3.Distance(keepNear, pos) > leash || !kv.Value.TryGetComponent(out Container chest) || (skip != null && skip.Contains(chest)))
+                {
+                    continue;
+                }
+                if (dist < bestDist)
                 {
                     bestDist = dist;
                     best = chest;
                 }
+                if (prefer != null && dist < bestPreferredDist && prefer(chest))
+                {
+                    bestPreferredDist = dist;
+                    bestPreferred = chest;
+                }
             }
-            return best;
+            return bestPreferred ?? best;
         }
 
         // Куда смотреть относительно взгляда игрока: «впереди», «справа сзади»…
+        private static string OreName(string prefab)
+        {
+            string p = prefab.ToLowerInvariant();
+            if (p.Contains("copper")) return "медь";
+            if (p.Contains("tin")) return "олово";
+            if (p.Contains("silver")) return "серебро";
+            if (p.Contains("obsidian")) return "обсидиан";
+            if (p.Contains("iron") || p.Contains("mudpile")) return "железный лом";
+            return null;
+        }
+
+        // Сторона света: в Валхейме север — +Z, восток — +X
+        public static string Compass(Vector3 from, Vector3 to)
+        {
+            Vector3 d = to - from;
+            if (new Vector2(d.x, d.z).magnitude < 1f)
+            {
+                return "здесь";
+            }
+            float angle = Mathf.Atan2(d.x, d.z) * Mathf.Rad2Deg;
+            if (angle < 0f)
+            {
+                angle += 360f;
+            }
+            string[] names = { "на север", "на северо-восток", "на восток", "на юго-восток", "на юг", "на юго-запад", "на запад", "на северо-запад" };
+            return names[Mathf.RoundToInt(angle / 45f) % 8];
+        }
+
+        public static string BiomeName(Heightmap.Biome biome)
+        {
+            switch (biome)
+            {
+                case Heightmap.Biome.Meadows: return "Луга";
+                case Heightmap.Biome.BlackForest: return "Чёрный лес";
+                case Heightmap.Biome.Swamp: return "Болота";
+                case Heightmap.Biome.Mountain: return "Горы";
+                case Heightmap.Biome.Plains: return "Равнины";
+                case Heightmap.Biome.Mistlands: return "Туманные земли";
+                case Heightmap.Biome.AshLands: return "Пепельные земли";
+                case Heightmap.Biome.DeepNorth: return "Глубокий север";
+                case Heightmap.Biome.Ocean: return "Океан";
+                case Heightmap.Biome.None: return "";
+                default: return biome.ToString();
+            }
+        }
+
+        // Что вокруг точки — одной строкой для памяти о месте: постройки, ресурсы, твари
+        public static string Surroundings(Vector3 at, Character self)
+        {
+            var parts = new List<string>();
+            var pieces = new List<Piece>();
+            Piece.GetAllPiecesInRadius(at, 25f, pieces);
+            var named = new Dictionary<string, int>();
+            int built = 0;
+            foreach (Piece piece in pieces)
+            {
+                if (piece == null || !piece.IsPlacedByPlayer())
+                {
+                    continue;
+                }
+                built++;
+                string label = null;
+                if (piece.GetComponent<Bed>() != null) label = "кровать";
+                else if (piece.TryGetComponent(out TeleportWorld portal)) label = portal.GetText().Length > 0 ? $"портал «{portal.GetText()}»" : "портал";
+                else if (piece.GetComponent<CraftingStation>() != null || piece.GetComponent<Smelter>() != null
+                    || piece.GetComponent<Fermenter>() != null || piece.GetComponent<Beehive>() != null || piece.GetComponent<CookingStation>() != null)
+                    label = Localization.instance.Localize(piece.m_name).ToLowerInvariant();
+                else if (piece.GetComponent<Container>() != null) label = "сундук";
+                else if (piece.GetComponent<Fireplace>() != null) label = "очаг";
+                if (label != null)
+                {
+                    named[label] = (named.TryGetValue(label, out int n) ? n : 0) + 1;
+                }
+            }
+            if (built > 0)
+            {
+                string list = string.Join(", ", named.OrderByDescending(kv => kv.Value).Take(8)
+                    .Select(kv => kv.Value > 1 ? $"{kv.Key} ×{kv.Value}" : kv.Key));
+                parts.Add($"построек {built}" + (list.Length > 0 ? $": {list}" : ""));
+            }
+            Survey look = Look(at, 50f, 99, 99);
+            var nature = new List<string>();
+            foreach (var ore in look.Ores.OrderByDescending(kv => kv.Value))
+            {
+                nature.Add($"{ore.Key} ×{ore.Value}");
+            }
+            if (look.Trees > 0)
+            {
+                nature.Add($"деревьев {look.Trees}");
+            }
+            nature.AddRange(look.Plants.Take(3).Select(g => $"{g.Name.ToLowerInvariant()} ×{g.Count}"));
+            if (nature.Count > 0)
+            {
+                parts.Add("рядом " + string.Join(", ", nature));
+            }
+            var beasts = Character.GetAllCharacters()
+                .Where(c => c != null && !c.IsDead() && !c.IsPlayer() && c != self && !c.IsTamed()
+                    && c.GetFaction() != Character.Faction.Players && Vector3.Distance(c.transform.position, at) < 60f)
+                .GroupBy(c => Localization.instance.Localize(c.m_name))
+                .Select(g => g.Count() > 1 ? $"{g.Key.ToLowerInvariant()} ×{g.Count()}" : g.Key.ToLowerInvariant())
+                .Take(5).ToList();
+            if (beasts.Count > 0)
+            {
+                parts.Add("твари: " + string.Join(", ", beasts));
+            }
+            string text = string.Join("; ", parts);
+            return text.Length > 240 ? text.Substring(0, 240) : text;
+        }
+
         public static string Direction(Transform viewer, Vector3 to)
         {
             Vector3 d = to - viewer.position;

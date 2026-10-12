@@ -2,7 +2,7 @@
 
 Что хранится (data/memory/<мир>__<персонаж>.json):
 - history — последние реплики и события, дословно (их видит каждый запрос);
-- facts — то, что компаньон усвоил надолго: о побратиме, о мире, уроки, договорённости;
+- facts — то, что компаньон усвоил надолго: о игроке, о мире, уроки, договорённости;
 - summary — короткая летопись того, что было раньше истории;
 - journal — заметные события игры (смерти, победы, ремесло), сырьё для размышлений.
 
@@ -58,14 +58,14 @@ REFLECT_PROMPT = """Ты — память {name}, спутника игрока 
 Тебе дают то, что {name} уже помнит, и то, что случилось с тех пор. Верни обновлённые летопись и список фактов.
 
 Что стоит помнить (kind):
-- player — о побратиме: имя и как он любит, чтобы его звали; что любит и чего не терпит; как обычно играет; о чём просил не делать или делать всегда.
+- player — о игроке: имя и как он любит, чтобы его звали; что любит и чего не терпит; как обычно играет; о чём просил не делать или делать всегда.
 - world — о мире: где дом и кровать, порталы, залежи руды, опасные места, какие боссы уже повержены.
 - lesson — уроки самого {name}: на чём ошибся, за что его поправили, что сработало.
 - bond — ваши отношения: клятвы, общие победы и потери, шутки, которые стали общими.
 
 Правила:
-- Просьбы побратима о твоём поведении («не болтай в бою», «зови меня ярлом», «не трогай мои грядки») сохраняй обязательно и дословно по смыслу — это самое важное.
-- Каждый факт — одна короткая фраза в третьем лице о побратиме или от лица {name} («Побратима зовут Варг, любит, когда его зовут ярлом», «Я слишком много болтаю — побратим просил молчать в бою»).
+- Просьбы игрока о твоём поведении («не болтай в бою», «зови меня ярлом», «не трогай мои грядки») сохраняй обязательно и дословно по смыслу — это самое важное.
+- Каждый факт — одна короткая фраза в третьем лице о игроке или от лица {name} («Игрока зовут Варг, любит, когда его зовут ярлом», «Я слишком много болтаю — игрок просил молчать в бою»).
 - Объединяй повторы, убирай устаревшее (если новое противоречит старому — оставь новое). Не больше {max_facts} фактов, самые важные — первыми.
 - Не храни мелочи: погоду, время суток, разовые приказы и их итоги («наруби дров», «сложил малину в сундук»), что сейчас лежит в сундуках — этому место разве что в летописи. Факт — то, что пригодится и через неделю.
 - Летопись — связный короткий рассказ: что вы прошли, кого победили, где живёте, что сейчас главное. Не дублируй в ней факты дословно.
@@ -92,6 +92,7 @@ class Memory:
         self.summary = ""
         self.journal: list[str] = []
         self.pending = 0
+        self.role = ""
         self.revision = 0
         self._reflecting = False
         self._last_reflect = 0.0
@@ -110,6 +111,7 @@ class Memory:
                 return
             self.key, self.world, self.player = key, world or "", player or ""
             self.history, self.facts, self.summary, self.journal, self.pending = [], [], "", [], 0
+            self.role = ""
             if not self.persist:
                 return
             try:
@@ -119,6 +121,7 @@ class Memory:
                 self.summary = str(data.get("summary", ""))
                 self.journal = [str(x) for x in data.get("journal", [])][-JOURNAL_KEPT:]
                 self.pending = int(data.get("pending", 0))
+                self.role = str(data.get("role", ""))
             except FileNotFoundError:
                 self._import_legacy()
             except (OSError, ValueError):
@@ -147,7 +150,7 @@ class Memory:
             data = {
                 "world": self.world, "player": self.player, "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "facts": self.facts, "summary": self.summary, "history": self.history,
-                "journal": self.journal, "pending": self.pending,
+                "journal": self.journal, "pending": self.pending, "role": self.role,
             }
             self.base_dir.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
@@ -184,6 +187,18 @@ class Memory:
             self.pending += 2   # события важнее болтовни — размышлять о них раньше
             self.save()
 
+    def mark_role(self, signature: str, title: str) -> None:
+        """Роль сменилась — пометка в истории, чтобы модель не подражала репликам прежней роли."""
+        with self.lock:
+            if signature == self.role:
+                return
+            if self.history:
+                self.history.append(f"[Здесь тебе сменили роль: теперь ты — «{title}». "
+                                    "Реплики выше сказаны в прежней роли, не подражай им.]")
+                self.history = self.history[-HISTORY_KEPT:]
+            self.role = signature
+            self.save()
+
     def remember(self, text: str, kind: str = "player") -> None:
         text = " ".join(text.split())[:FACT_CHARS]
         if not text or not self.enabled:
@@ -214,7 +229,7 @@ class Memory:
                 parts.append("Летопись: " + self.summary)
             if self.facts:
                 parts.append("\n".join(f"- {f['text']}" for f in self.facts))
-            parts.append("Опирайся на это, когда к месту: обращайся к побратиму так, как он любит, вспоминай общее прошлое, "
+            parts.append("Опирайся на это, когда к месту: обращайся к игроку так, как он любит, вспоминай общее прошлое, "
                          "не повторяй ошибок из уроков. Не пересказывай память без повода.")
             return "\n".join(parts)
 
