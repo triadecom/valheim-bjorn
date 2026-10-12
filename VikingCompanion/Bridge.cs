@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -22,10 +23,34 @@ namespace VikingCompanion
             public float distance;
         }
 
+        // Растения или звери одного вида рядом: сколько и где ближайший
+        [Serializable]
+        public class NearInfo
+        {
+            public string name;
+            public int count;
+            public float nearest;
+            public string where;
+        }
+
+        [Serializable]
+        public class ChestInfo
+        {
+            public float distance;
+            public string where;
+            public string contents;
+            public int used;
+            public int total;
+        }
+
         [Serializable]
         public class GameState
         {
             public string player_name;
+            public string world;
+            public int player_foods;
+            public string player_items;
+            public string home;
             public float player_hp;
             public float player_hp_max;
             public float player_weight;
@@ -35,6 +60,10 @@ namespace VikingCompanion
             public float companion_hp_max;
             public string companion_mode;
             public string companion_carry;
+            public string companion_plan;
+            public string companion_style;
+            public string companion_bow;
+            public int companion_arrows;
             public string biome;
             public int day;
             public string time_of_day;
@@ -46,6 +75,9 @@ namespace VikingCompanion
             public string rocks_where;
             public int items_near;
             public EnemyInfo[] enemies;
+            public NearInfo[] plants;
+            public NearInfo[] animals;
+            public ChestInfo[] chests;
         }
 
         [Serializable]
@@ -56,12 +88,62 @@ namespace VikingCompanion
             public GameState state;
         }
 
-        [Serializable]
         public class Reply
         {
-            public string say;
-            public string action;
-            public string error;
+            public string say = "";
+            public List<PlanStep> plan = new List<PlanStep>();
+            public string error = "";
+
+            public static Reply From(string body, string error)
+            {
+                Dictionary<string, object> obj = Json.Obj(Json.Parse(body));
+                if (obj == null)
+                {
+                    return new Reply { error = error ?? (body == null ? "empty" : "bad_json") };
+                }
+                return new Reply { say = Json.Str(obj, "say"), plan = PlanStep.FromReply(obj), error = Json.Str(obj, "error") };
+            }
+        }
+
+        // Настройки характера и голоса — мосту (вкладка «Бьёрн» в настройках игры и конфиг)
+        [Serializable]
+        private class BridgeConfig
+        {
+            public string name;
+            public string role;
+            public string role_custom;
+            public string length;
+            public int humor;
+            public int rudeness;
+            public string chattiness;
+            public string thinking;
+            public bool memory;
+            public bool tts;
+            public string voice;
+            public string tone;
+            public string tempo;
+            public float volume;
+            public bool fillers;
+        }
+
+        [Serializable]
+        private class NoteRequest
+        {
+            public string text;
+            public GameState state;
+        }
+
+        [Serializable]
+        private class StateRequest
+        {
+            public GameState state;
+        }
+
+        public class MemoryInfo
+        {
+            public int facts;
+            public string world = "";
+            public bool ok;
         }
 
         private static readonly HttpClient s_http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -97,15 +179,25 @@ namespace VikingCompanion
             public bool recording;
         }
 
-        [Serializable]
-        public class VoiceReply
+        public class VoiceReply : Reply
         {
-            public string transcript;
-            public string say;
-            public string action;
-            public string error;
+            public string transcript = "";
             public float total_ms;
             public bool speculative;
+
+            public static new VoiceReply From(string body, string error)
+            {
+                Dictionary<string, object> obj = Json.Obj(Json.Parse(body));
+                if (obj == null)
+                {
+                    return new VoiceReply { error = error ?? (body == null ? "empty" : "bad_json") };
+                }
+                return new VoiceReply
+                {
+                    say = Json.Str(obj, "say"), plan = PlanStep.FromReply(obj), error = Json.Str(obj, "error"),
+                    transcript = Json.Str(obj, "transcript"), total_ms = (float)Json.Num(obj, "total_ms"), speculative = Json.Bool(obj, "speculative"),
+                };
+            }
         }
 
         public static void Send(string kind, string text, GameState state, Action<Reply> onDone)
@@ -115,7 +207,7 @@ namespace VikingCompanion
             Request("/v1/event", json, (body, error) =>
             {
                 Interlocked.Decrement(ref s_inFlight);
-                Reply reply = Parse<Reply>(body, ref error) ?? new Reply { say = "", action = "none", error = error ?? "empty" };
+                Reply reply = Reply.From(body, error);
                 if (!string.IsNullOrEmpty(reply.error) && !s_warnedOffline)
                 {
                     s_warnedOffline = true;
@@ -141,8 +233,86 @@ namespace VikingCompanion
         public static void VoiceStop(GameState state, Action<VoiceReply> onDone)
         {
             string json = Json.Serialize(new VoiceRequest { state = state, test_audio = "" });
-            Request("/v1/voice/stop", json, (body, error) =>
-                onDone(Parse<VoiceReply>(body, ref error) ?? new VoiceReply { say = "", action = "none", error = error ?? "empty" }));
+            Request("/v1/voice/stop", json, (body, error) => onDone(VoiceReply.From(body, error)));
+        }
+
+        // ---------- Память и настройки ----------
+
+        // Событие игры для памяти: без ответа модели, ничего не стоит
+        public static void Note(string text, GameState state)
+        {
+            if (!s_startAttempted)
+            {
+                return;
+            }
+            Request("/v1/note", Json.Serialize(new NoteRequest { text = text, state = state }), (body, error) => { });
+        }
+
+        public static void QueryMemory(GameState state, Action<MemoryInfo> onDone)
+        {
+            Request("/v1/memory", Json.Serialize(new StateRequest { state = state }), (body, error) =>
+            {
+                Dictionary<string, object> obj = Json.Obj(Json.Parse(body));
+                onDone(new MemoryInfo { ok = obj != null, facts = Json.List(obj, "facts").Count, world = Json.Str(obj, "world") });
+            });
+        }
+
+        public static void ForgetMemory(GameState state, Action<bool> onDone)
+        {
+            Request("/v1/memory/forget", Json.Serialize(new StateRequest { state = state }), (body, error) => onDone(error == null));
+        }
+
+        private static BridgeConfig CurrentConfig()
+        {
+            return new BridgeConfig
+            {
+                name = Plugin.CompanionName.Value,
+                role = Plugin.Role.Value,
+                role_custom = Plugin.RoleCustom.Value,
+                length = Plugin.ReplyLength.Value,
+                humor = Plugin.Humor.Value,
+                rudeness = Plugin.Rudeness.Value,
+                chattiness = Plugin.Chattiness.Value,
+                thinking = Plugin.Thinking.Value,
+                memory = Plugin.Learn.Value,
+                tts = Plugin.TtsEnabled.Value,
+                voice = Plugin.TtsVoice.Value,
+                tone = Plugin.TtsTone.Value,
+                tempo = Plugin.TtsTempo.Value,
+                volume = Plugin.TtsVolume.Value,
+                fillers = Plugin.TtsFillers.Value,
+            };
+        }
+
+        // Мост уже работает — шлём сразу; иначе настройки уйдут с запуском (файл --config)
+        public static void PushConfig()
+        {
+            if (!s_startAttempted)
+            {
+                return;
+            }
+            Request("/v1/config", Json.Serialize(CurrentConfig()), (body, error) =>
+            {
+                if (error != null)
+                {
+                    Plugin.Log.LogWarning($"Настройки не дошли до моста: {error}");
+                }
+            });
+        }
+
+        private static string WriteConfigFile()
+        {
+            try
+            {
+                string path = Path.Combine(BepInEx.Paths.ConfigPath, Plugin.Guid + ".bridge.json");
+                File.WriteAllText(path, Json.Serialize(CurrentConfig()), new UTF8Encoding(false));
+                return path;
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning($"Файл настроек для моста не записан: {e.Message}");
+                return null;
+            }
         }
 
         public static void VoiceCancel()
@@ -265,6 +435,7 @@ namespace VikingCompanion
                     if (running)
                     {
                         Plugin.Log.LogInfo("Мост уже запущен");
+                        PushConfig();
                     }
                     else
                     {
@@ -292,6 +463,12 @@ namespace VikingCompanion
             if (!Plugin.TtsFillers.Value)
             {
                 args.Add("--no-fillers");
+            }
+            string config = WriteConfigFile();
+            if (config != null)
+            {
+                args.Add("--config");
+                args.Add("\"" + config + "\"");
             }
             // Для тестов: фейковый микрофон, без звука
             string extra = Environment.GetEnvironmentVariable("VCOMP_BRIDGE_ARGS");

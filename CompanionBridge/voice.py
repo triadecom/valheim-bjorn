@@ -207,6 +207,12 @@ class Speaker:
         threading.Thread(target=self._worker, daemon=True).start()
         log.info("TTS %s готов за %.1fs", type(engine).__name__, time.monotonic() - started)
 
+    def set_engine(self, engine) -> None:
+        """Сменить голос на лету: междометия пересинтезируются новым голосом."""
+        fillers = [engine.synth(t) for t in ("Хм.", "Так...", "Ну-ка...", "Хм-м.")]
+        self.engine = engine
+        self._fillers = fillers
+
     @property
     def speaking(self) -> bool:
         return self._speaking or not self._queue.empty()

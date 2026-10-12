@@ -20,6 +20,9 @@ namespace VikingCompanion
         public static readonly HashSet<string> KitNames = new HashSet<string>();
         // Внутренние имена предметов снаряжения ($item_axe_bronze): проверка без выделения памяти
         private static readonly HashSet<string> s_kitItemNames = new HashSet<string>();
+        // «ArrowFlint:60» — сколько штук держать при себе (досыпается при появлении и каждый день)
+        public static readonly Dictionary<string, int> KitCounts = new Dictionary<string, int>();
+        public static int KitArrowCount { get; private set; }
 
         public static bool IsKitItem(ItemDrop.ItemData item) => s_kitItemNames.Contains(item.m_shared.m_name);
 
@@ -128,22 +131,36 @@ namespace VikingCompanion
             var items = new List<GameObject>();
             KitNames.Clear();
             s_kitItemNames.Clear();
+            KitCounts.Clear();
+            KitArrowCount = 0;
             foreach (string raw in Plugin.Kit.Value.Split(','))
             {
-                string name = raw.Trim();
+                string[] parts = raw.Split(':');
+                string name = parts[0].Trim();
                 if (name.Length == 0)
                 {
                     continue;
                 }
                 GameObject prefab = scene.GetPrefab(name);
-                if (prefab == null || prefab.GetComponent<ItemDrop>() == null)
+                ItemDrop drop = prefab != null ? prefab.GetComponent<ItemDrop>() : null;
+                if (drop == null)
                 {
                     Plugin.Log.LogWarning($"Предмет снаряжения не найден: {name}");
                     continue;
                 }
-                items.Add(prefab);
                 KitNames.Add(name);
-                s_kitItemNames.Add(prefab.GetComponent<ItemDrop>().m_itemData.m_shared.m_name);
+                s_kitItemNames.Add(drop.m_itemData.m_shared.m_name);
+                if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out int count) && count > 1)
+                {
+                    // Расходное (стрелы) не выдаём через m_defaultItems — там по одной штуке
+                    KitCounts[name] = count;
+                    if (drop.m_itemData.m_shared.m_itemType == ItemDrop.ItemData.ItemType.Ammo)
+                    {
+                        KitArrowCount += count;
+                    }
+                    continue;
+                }
+                items.Add(prefab);
             }
             return items.ToArray();
         }

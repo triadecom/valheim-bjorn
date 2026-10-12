@@ -6,10 +6,11 @@ using UnityEngine;
 namespace VikingCompanion
 {
     // Поведение компаньона поверх MonsterAI: бой и следование делает ванильный ИИ,
-    // а рубка, добыча, сбор и передача вещей — этот компонент (из постфикса UpdateAI).
+    // а рубка, добыча, сбор трав, охота с луком, сундук и передача вещей — этот компонент (из UpdateAI).
+    // Приказы приходят планом из нескольких шагов; шаги выполняются по очереди, итог — одним отчётом.
     public class Companion : MonoBehaviour, Interactable
     {
-        public enum Mode { Follow, Stay, Work, Loot, Give }
+        public enum Mode { Follow, Stay, Work, Loot, Give, Pick, Hunt, Store, Fetch }
         public enum WorkKind { Wood, Stone }
 
         public static Companion Local { get; private set; }
@@ -25,6 +26,7 @@ namespace VikingCompanion
         private const float LootRadius = 12f;
         private const int WorkGoal = 50;
         private const string ModeKey = "vc_mode";
+        private const float ShootRange = 28f;
 
         private ZNetView m_nview;
         private float m_taskTimeLeft;
@@ -42,6 +44,8 @@ namespace VikingCompanion
         private ItemDrop m_loot;
         private float m_lootSince;
         private float m_lootSearchTimer;
+        private Vector3 m_lootCenter;
+        private bool m_lootAroundCenter;
         private int m_looted;
         private float m_huntUntil;
         private Vector3 m_stayPoint;
@@ -50,8 +54,49 @@ namespace VikingCompanion
         private readonly HashSet<ZDOID> m_skipTargets = new HashSet<ZDOID>();
         private readonly HashSet<int> m_skipLoot = new HashSet<int>();
 
+        // План: очередь шагов и итоги выполненных
+        private readonly Queue<PlanStep> m_plan = new Queue<PlanStep>();
+        private readonly List<string> m_results = new List<string>();
+        private PlanStep m_step;
+        private Vector3 m_planOrigin;
+        private bool m_planHadTask;
+
+        // Параметры текущего дела
+        private string m_what = "";
+        private int m_goal;
+        private Dictionary<string, int> m_snapshot = new Dictionary<string, int>();
+        private System.Func<Catalog.PickInfo, bool> m_pickFilter;
+        private HashSet<string> m_pickNames = new HashSet<string>();
+        private System.Func<ItemDrop.ItemData, bool> m_itemFilter;
+        private System.Func<string, bool> m_rockFilter;
+        private Pickable m_pickable;
+        private float m_pickedAt;
+
+        // Охота
+        private Character m_prey;
+        private Vector3 m_preyLastPos;
+        private int m_kills;
+        private int m_shotsAtPrey;
+        private float m_nextShot;
+        private float m_drawStart = -1f;
+        private float m_preySince;
+        private float m_lootUntil;
+        private readonly Dictionary<string, int> m_killed = new Dictionary<string, int>();
+
+        // Сундук
+        private Container m_chest;
+        private float m_chestPhaseAt = -1f;
+        private bool m_chestOpenedByMe;
+
+        private int m_lastArrowDay = -1;
+        // Дело не начать (нечего отдавать, не понял, что взять) — итог без хождения
+        private string m_immediateResult;
+
         public string Name => Humanoid != null ? Humanoid.m_name : Plugin.CompanionName.Value;
         public bool IsHunting => Time.time < m_huntUntil;
+        public bool PrefersBow => Plugin.CombatStyle.Value == "bow";
+        // По кому целиться из лука: на охоте — дичь, в бою — враг ванильного ИИ
+        public Character AimTarget => CurrentMode == Mode.Hunt && m_prey != null && Ai.m_targetCreature == null ? m_prey : Ai.m_targetCreature;
 
         private static void Debug(string message)
         {
@@ -81,6 +126,8 @@ namespace VikingCompanion
             m_restoring = true;
             SetMode(m_nview.GetZDO().GetInt(ModeKey) == (int)Mode.Stay ? Mode.Stay : Mode.Follow);
             m_restoring = false;
+            // Снаряжение выдаёт Humanoid.Start — стрелы досыпаем следом
+            Invoke(nameof(TopUpKit), 0.5f);
             CompanionManager.OnCompanionLoaded(this);
         }
 
@@ -122,17 +169,218 @@ namespace VikingCompanion
             return new Vector3(0.55f, 0.32f, 0.16f);
         }
 
+        // Стрелы из снаряжения: досыпать до нормы при появлении и с каждым новым днём («настрогал за ночь»)
+        private void TopUpKit()
+        {
+            Inventory inv = Humanoid.GetInventory();
+            foreach (KeyValuePair<string, int> kit in CompanionPrefab.KitCounts)
+            {
+                GameObject prefab = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(kit.Key) : null;
+                ItemDrop drop = prefab != null ? prefab.GetComponent<ItemDrop>() : null;
+                if (drop == null)
+                {
+                    continue;
+                }
+                int have = inv.CountItems(drop.m_itemData.m_shared.m_name);
+                if (have < kit.Value)
+                {
+                    inv.AddItem(prefab, kit.Value - have);
+                }
+            }
+            m_lastArrowDay = EnvMan.instance != null ? EnvMan.instance.GetDay() : -1;
+        }
+
+        // ---------- План ----------
+
+        public void RunPlan(List<PlanStep> plan)
+        {
+            if (plan == null || plan.Count == 0)
+            {
+                return;
+            }
+            // «Стреляй из лука» посреди работы — не повод бросать работу
+            if (plan.All(s => s.Do == "combat_style"))
+            {
+                foreach (PlanStep step in plan)
+                {
+                    Begin(step);
+                }
+                return;
+            }
+            m_plan.Clear();
+            m_results.Clear();
+            m_planHadTask = false;
+            Player player = Player.m_localPlayer;
+            m_planOrigin = player != null ? player.transform.position : transform.position;
+            foreach (PlanStep step in plan)
+            {
+                m_plan.Enqueue(step);
+            }
+            Plugin.Log.LogInfo($"План: {string.Join(", ", plan)}");
+            StartNext();
+        }
+
+        public void CancelPlan()
+        {
+            m_plan.Clear();
+            m_results.Clear();
+            m_step = null;
+        }
+
+        // Занят делом: идёт задание или в очереди есть шаги
+        public bool OnTask => m_plan.Count > 0 || (CurrentMode != Mode.Follow && CurrentMode != Mode.Stay);
+
+        public string DescribePlan()
+        {
+            return m_plan.Count > 0 ? PlanStep.Describe(m_plan) : "";
+        }
+
+        private void StartNext()
+        {
+            while (m_plan.Count > 0)
+            {
+                PlanStep step = m_plan.Dequeue();
+                if (Begin(step))
+                {
+                    return;
+                }
+            }
+            // План кончился: вернуться к побратиму (если не велено сторожить) и рассказать, что сделано
+            m_step = null;
+            if (CurrentMode != Mode.Stay)
+            {
+                SetMode(Mode.Follow);
+            }
+            if (m_results.Count > 0)
+            {
+                var results = new List<string>(m_results);
+                m_results.Clear();
+                CompanionManager.OnPlanFinished(this, results);
+            }
+        }
+
+        // true — началось дело, которое длится; false — шаг выполнен сразу
+        private bool Begin(PlanStep step)
+        {
+            m_step = step;
+            m_what = step.What ?? "";
+            switch (step.Do)
+            {
+                case "follow":
+                case "come":
+                    SetMode(Mode.Follow);
+                    return false;
+                case "stay":
+                    // «Наруби дров, а потом жди тут» — «тут» это где побратим отдал приказ
+                    if (m_planHadTask)
+                    {
+                        m_stayPoint = m_planOrigin;
+                        SetMode(Mode.Stay, keepPoint: true);
+                    }
+                    else
+                    {
+                        SetMode(Mode.Stay);
+                    }
+                    return false;
+                case "attack":
+                    SetMode(Mode.Follow);
+                    Hunt(60f);
+                    return false;
+                case "combat_style":
+                    Plugin.CombatStyle.Value = Catalog.Normalize(step.What).Contains("bow") || Catalog.Normalize(step.What).Contains("лук") ? "bow" : "melee";
+                    m_nextEquip = 0f;
+                    if (CurrentMode == Mode.Follow || CurrentMode == Mode.Stay)
+                    {
+                        EquipCombat();
+                    }
+                    return false;
+                case "gather_wood":
+                    m_planHadTask = true;
+                    SetMode(Mode.Work, WorkKind.Wood, step.Count);
+                    return Started(Mode.Work);
+                case "mine":
+                    m_planHadTask = true;
+                    SetMode(Mode.Work, WorkKind.Stone, step.Count);
+                    return Started(Mode.Work);
+                case "pick":
+                    m_planHadTask = true;
+                    SetMode(Mode.Pick, goal: step.Count);
+                    return Started(Mode.Pick);
+                case "hunt":
+                    m_planHadTask = true;
+                    SetMode(Mode.Hunt, goal: step.Count);
+                    return Started(Mode.Hunt);
+                case "loot":
+                    m_planHadTask = true;
+                    SetMode(Mode.Loot);
+                    return Started(Mode.Loot);
+                case "give_items":
+                    m_planHadTask = true;
+                    SetMode(Mode.Give);
+                    return Started(Mode.Give);
+                case "store":
+                    m_planHadTask = true;
+                    SetMode(Mode.Store);
+                    return Started(Mode.Store);
+                case "fetch":
+                    m_planHadTask = true;
+                    SetMode(Mode.Fetch, goal: step.Count);
+                    return Started(Mode.Fetch);
+                default:
+                    Plugin.Log.LogWarning($"Неизвестный шаг плана: {step.Do}");
+                    return false;
+            }
+        }
+
+        private bool Started(Mode mode)
+        {
+            if (m_immediateResult != null)
+            {
+                m_results.Add(m_immediateResult);
+                m_immediateResult = null;
+                SetMode(Mode.Follow);
+                return false;
+            }
+            return CurrentMode == mode;
+        }
+
+        // Дело кончилось: записать итог и взяться за следующий шаг
+        private void Finish(string result)
+        {
+            Debug($"итог шага {m_step}: {result}");
+            if (!string.IsNullOrEmpty(result))
+            {
+                m_results.Add(result);
+            }
+            EndHuntDraw();
+            if (m_chestOpenedByMe && m_chest != null)
+            {
+                m_chest.SetInUse(false);
+            }
+            m_chestOpenedByMe = false;
+            CurrentMode = Mode.Follow;
+            Ai.SetFollowTarget(Player.m_localPlayer != null ? Player.m_localPlayer.gameObject : null);
+            StartNext();
+        }
+
         // ---------- Режимы ----------
 
-        public void SetMode(Mode mode, WorkKind work = WorkKind.Wood)
+        public void SetMode(Mode mode, WorkKind work = WorkKind.Wood, int goal = 0, bool keepPoint = false)
         {
             Player player = Player.m_localPlayer;
+            EndHuntDraw();
             CurrentMode = mode;
             m_target = null;
             m_loot = null;
             m_looted = 0;
             m_lootSearchTimer = 0f;
+            m_lootAroundCenter = false;
             m_stuckTimer = 0f;
+            m_bestDist = float.MaxValue;
+            m_pickable = null;
+            m_prey = null;
+            m_chest = null;
+            m_chestPhaseAt = -1f;
             m_skipTargets.Clear();
             m_skipLoot.Clear();
             if (m_nview != null && m_nview.IsValid() && m_nview.IsOwner())
@@ -150,38 +398,76 @@ namespace VikingCompanion
                 case Mode.Stay:
                     Ai.SetFollowTarget(null);
                     // Точка охраны в ZDO переживает выгрузку зоны
-                    m_stayPoint = Ai.GetPatrolPoint(out Vector3 saved) && m_restoring ? saved : transform.position;
+                    if (!keepPoint)
+                    {
+                        m_stayPoint = Ai.GetPatrolPoint(out Vector3 saved) && m_restoring ? saved : transform.position;
+                    }
                     Ai.SetPatrolPoint(m_stayPoint);
                     EquipCombat();
                     break;
                 case Mode.Work:
-                    Ai.SetFollowTarget(null);
-                    Ai.ResetPatrolPoint();
+                    BeginTask(240f);
                     CurrentWork = work;
-                    m_taskTimeLeft = 240f;
-                    m_workOrigin = transform.position;
+                    m_goal = goal > 0 ? goal : WorkGoal;
+                    m_rockFilter = work == WorkKind.Stone ? Catalog.RockFilter(m_what) : null;
                     m_startCount = CountGathered();
                     EquipTool();
                     break;
+                case Mode.Pick:
+                    BeginTask(180f);
+                    m_goal = goal > 0 ? goal : 60;
+                    m_pickFilter = Catalog.PickFilter(m_what);
+                    m_pickNames.Clear();
+                    break;
+                case Mode.Hunt:
+                    BeginTask(240f);
+                    m_goal = goal > 0 ? goal : 2;
+                    m_kills = 0;
+                    m_killed.Clear();
+                    m_shotsAtPrey = 0;
+                    m_lootUntil = 0f;
+                    break;
                 case Mode.Loot:
-                    Ai.SetFollowTarget(null);
-                    Ai.ResetPatrolPoint();
-                    m_taskTimeLeft = 60f;
-                    m_workOrigin = transform.position;
+                    BeginTask(60f);
+                    m_lootCenter = m_workOrigin;
+                    m_lootAroundCenter = true;
                     break;
                 case Mode.Give:
-                    Ai.SetFollowTarget(null);
-                    Ai.ResetPatrolPoint();
-                    m_taskTimeLeft = 40f;
-                    if (CountGathered() == 0)
+                    BeginTask(40f);
+                    m_itemFilter = Catalog.ItemFilter(m_what);
+                    if (!GatheredItems(m_itemFilter, m_what).Any())
                     {
                         // Отдавать нечего — незачем идти
-                        CurrentMode = Mode.Follow;
-                        Ai.SetFollowTarget(player != null ? player.gameObject : null);
-                        CompanionManager.OnTaskFinished(this, "give_empty", "");
+                        m_immediateResult = Catalog.IsAll(m_what) ? "отдавать было нечего: мешок пуст" : $"отдавать было нечего: «{m_what}» у тебя нет";
+                    }
+                    break;
+                case Mode.Store:
+                    BeginTask(60f);
+                    m_itemFilter = Catalog.ItemFilter(m_what);
+                    if (!GatheredItems(m_itemFilter, m_what).Any())
+                    {
+                        m_immediateResult = Catalog.IsAll(m_what) ? "складывать в сундук было нечего" : $"складывать в сундук было нечего: «{m_what}» у тебя нет";
+                    }
+                    break;
+                case Mode.Fetch:
+                    BeginTask(60f);
+                    m_goal = goal;
+                    m_itemFilter = Catalog.ItemFilter(m_what);
+                    if (Catalog.IsAll(m_what))
+                    {
+                        m_immediateResult = "не понял, что взять из сундука";
                     }
                     break;
             }
+        }
+
+        private void BeginTask(float seconds)
+        {
+            Ai.SetFollowTarget(null);
+            Ai.ResetPatrolPoint();
+            m_taskTimeLeft = seconds;
+            m_workOrigin = transform.position;
+            m_snapshot = Snapshot();
         }
 
         public void Hunt(float seconds)
@@ -204,6 +490,10 @@ namespace VikingCompanion
                 case Mode.Work: return CurrentWork == WorkKind.Wood ? "рубит лес" : "добывает камень";
                 case Mode.Loot: return "собирает вещи с земли";
                 case Mode.Give: return "несёт добычу побратиму";
+                case Mode.Pick: return "собирает " + (m_what.Length > 0 ? m_what : "травы и ягоды");
+                case Mode.Hunt: return "охотится" + (m_what.Length > 0 ? " на " + m_what : "") + (m_kills > 0 ? $" (добыто {m_kills})" : "");
+                case Mode.Store: return "несёт добычу в сундук";
+                case Mode.Fetch: return "идёт к сундуку за " + m_what;
                 default: return InCombat() ? "бьётся с врагом" : "идёт следом";
             }
         }
@@ -211,7 +501,7 @@ namespace VikingCompanion
         public string DescribeCarry()
         {
             var parts = new List<string>();
-            foreach (var group in GatheredItems().GroupBy(i => i.m_shared.m_name))
+            foreach (var group in GatheredItems(null, "").GroupBy(i => i.m_shared.m_name))
             {
                 parts.Add($"{Localization.instance.Localize(group.Key)} ×{group.Sum(i => i.m_stack)}");
             }
@@ -223,7 +513,7 @@ namespace VikingCompanion
             return Ai.m_targetCreature != null && !Ai.m_targetCreature.IsDead();
         }
 
-        // ---------- Кадр ИИ (вызывается после MonsterAI.UpdateAI) ----------
+        // ---------- Кадр ИИ (вызывается вместо MonsterAI.UpdateAI, когда врага нет) ----------
 
         // Всё, кроме следования, ведём сами: ванильный ИИ тогда только ищет врагов
         public bool ControlsMovement => CurrentMode != Mode.Follow;
@@ -249,6 +539,25 @@ namespace VikingCompanion
                 case Mode.Give:
                     UpdateGive(dt, player);
                     break;
+                case Mode.Pick:
+                    UpdatePick(dt);
+                    break;
+                case Mode.Hunt:
+                    UpdateHunt(dt);
+                    break;
+                case Mode.Store:
+                case Mode.Fetch:
+                    UpdateChest(dt, player);
+                    break;
+            }
+        }
+
+        // Раз в несколько секунд при любом режиме (из CompanionManager)
+        public void SlowUpdate()
+        {
+            if (EnvMan.instance != null && m_lastArrowDay >= 0 && EnvMan.instance.GetDay() != m_lastArrowDay)
+            {
+                TopUpKit();
             }
         }
 
@@ -278,9 +587,9 @@ namespace VikingCompanion
         {
             m_taskTimeLeft -= dt;
             int gathered = CountGathered() - m_startCount;
-            if (m_taskTimeLeft <= 0f || gathered >= WorkGoal)
+            if (m_taskTimeLeft <= 0f || gathered >= m_goal)
             {
-                Finish(CurrentWork == WorkKind.Wood ? "work_wood_done" : "work_stone_done");
+                FinishGathering(CurrentWork == WorkKind.Wood ? "нарубил" : "добыл", "");
                 return;
             }
 
@@ -316,7 +625,8 @@ namespace VikingCompanion
                         m_lootSearchTimer = 0f;
                         return;
                     }
-                    Finish(CurrentWork == WorkKind.Wood ? "work_wood_none" : "work_stone_none");
+                    string none = CurrentWork == WorkKind.Wood ? "деревьев в округе больше нет" : "подходящих камней в округе больше нет";
+                    FinishGathering(CurrentWork == WorkKind.Wood ? "нарубил" : "добыл", none);
                 }
                 return;
             }
@@ -457,7 +767,7 @@ namespace VikingCompanion
                 return null;
             }
             ZNetView nview = WorldScan.FindNearest(transform.position, SearchRadius, wood, tier,
-                player.transform.position, Leash, m_skipTargets);
+                player.transform.position, Leash, m_skipTargets, m_rockFilter);
             if (nview == null)
             {
                 return null;
@@ -488,7 +798,471 @@ namespace VikingCompanion
             SetTarget(null);
         }
 
-        // ---------- Сбор вещей ----------
+        // ---------- Сбор растений ----------
+
+        private void UpdatePick(float dt)
+        {
+            m_taskTimeLeft -= dt;
+            int picked = CountNames(m_pickNames);
+            if (m_taskTimeLeft <= 0f || picked >= m_goal)
+            {
+                FinishGathering("собрал", "");
+                return;
+            }
+            // Сорванное падает под ноги — подобрать
+            if (StepLoot(dt, 5f) == LootState.Busy)
+            {
+                return;
+            }
+            if (Time.time - m_pickedAt < 0.5f)
+            {
+                Ai.StopMoving();
+                return;
+            }
+            if (m_pickable == null || !m_pickable.CanBePicked())
+            {
+                m_searchTimer -= dt;
+                if (m_searchTimer > 0f)
+                {
+                    Ai.StopMoving();
+                    return;
+                }
+                m_searchTimer = 1f;
+                Player player = Player.m_localPlayer;
+                m_pickable = WorldScan.FindNearestPickable(transform.position, 50f, m_pickFilter, player.transform.position, Leash, m_skipTargets);
+                m_targetSince = Time.time;
+                m_bestDist = float.MaxValue;
+                m_stuckTimer = 0f;
+                if (m_pickable == null)
+                {
+                    if (FindLoot(8f) != null)
+                    {
+                        m_lootSearchTimer = 0f;
+                        return;
+                    }
+                    FinishGathering("собрал", picked == 0 ? (m_what.Length > 0 ? $"{m_what} поблизости не нашлось" : "трав и ягод поблизости не нашлось") : "");
+                    return;
+                }
+                if (Catalog.TryPick(m_pickable.m_nview.GetZDO().GetPrefab(), out Catalog.PickInfo info))
+                {
+                    m_pickNames.Add(info.ItemToken);
+                }
+                Debug($"рву {m_pickable.name} в {Vector3.Distance(m_pickable.transform.position, transform.position):0.0} м");
+                return;
+            }
+
+            Vector3 pos = m_pickable.transform.position;
+            float dist = Utils.DistanceXZ(pos, transform.position);
+            if (dist < m_bestDist - 0.25f)
+            {
+                m_bestDist = dist;
+                m_stuckTimer = 0f;
+            }
+            else
+            {
+                m_stuckTimer += dt;
+            }
+            // Куст широкий: рвать можно и с пары шагов, а если упёрся в ветки — с того места, где стоит
+            if (dist > 1.8f && !(dist < 3f && m_stuckTimer > 1.5f))
+            {
+                Ai.MoveTo(dt, pos, 1f, dist > 8f);
+                if (m_stuckTimer > 8f || Time.time - m_targetSince > 30f)
+                {
+                    SkipPickable();
+                }
+                return;
+            }
+            Ai.StopMoving();
+            Ai.LookAt(pos + Vector3.up * 0.5f);
+            Humanoid.m_zanim.SetTrigger("interact");
+            m_pickable.Interact(Humanoid, false, false);
+            m_pickedAt = Time.time;
+            m_lootSearchTimer = 0f;
+            SkipPickable();
+        }
+
+        private void SkipPickable()
+        {
+            ZDO zdo = m_pickable != null && m_pickable.m_nview != null ? m_pickable.m_nview.GetZDO() : null;
+            if (zdo != null)
+            {
+                m_skipTargets.Add(zdo.m_uid);
+            }
+            m_pickable = null;
+        }
+
+        private int CountNames(HashSet<string> names)
+        {
+            int sum = 0;
+            foreach (ItemDrop.ItemData item in Humanoid.GetInventory().GetAllItems())
+            {
+                if (names.Contains(item.m_shared.m_name))
+                {
+                    sum += item.m_stack;
+                }
+            }
+            int before = 0;
+            foreach (string name in names)
+            {
+                before += m_snapshot.TryGetValue(name, out int n) ? n : 0;
+            }
+            return sum - before;
+        }
+
+        // ---------- Охота с луком ----------
+
+        private void UpdateHunt(float dt)
+        {
+            m_taskTimeLeft -= dt;
+            // Только что добыли зверя — подобрать мясо и шкуру
+            if (Time.time < m_lootUntil)
+            {
+                EndHuntDraw();
+                if (StepLoot(dt, 7f) == LootState.Busy)
+                {
+                    // Пока находит, что подобрать, — не торопится дальше
+                    m_lootUntil = Mathf.Max(m_lootUntil, Time.time + 3f);
+                    return;
+                }
+                if (Utils.DistanceXZ(m_lootCenter, transform.position) > 3f)
+                {
+                    Ai.MoveTo(dt, m_lootCenter, 1.5f, true);
+                    return;
+                }
+                Ai.StopMoving();
+                return;
+            }
+            m_lootAroundCenter = false;
+            if (m_kills >= m_goal || m_taskTimeLeft <= 0f)
+            {
+                FinishHunt(m_kills >= m_goal ? "" : "время вышло");
+                return;
+            }
+
+            if (m_prey != null && !m_prey.IsDead())
+            {
+                m_preyLastPos = m_prey.transform.position;
+            }
+            if (m_prey == null || m_prey.IsDead())
+            {
+                if (m_prey != null || m_shotsAtPrey > 0)
+                {
+                    // Был зверь — и пал
+                    if (m_shotsAtPrey > 0 || m_prey != null)
+                    {
+                        m_kills++;
+                        string name = m_prey != null ? Localization.instance.Localize(m_prey.m_name) : "зверь";
+                        m_killed[name] = (m_killed.TryGetValue(name, out int k) ? k : 0) + 1;
+                        Plugin.Log.LogInfo($"Охота: добыт {name} (выстрелов {m_shotsAtPrey})");
+                        m_lootCenter = m_preyLastPos;
+                        m_lootAroundCenter = true;
+                        m_lootUntil = Time.time + 12f;
+                        m_lootSearchTimer = 1.5f;   // туша падает не сразу
+                    }
+                    m_prey = null;
+                    m_shotsAtPrey = 0;
+                    return;
+                }
+                m_searchTimer -= dt;
+                if (m_searchTimer > 0f)
+                {
+                    Ai.StopMoving();
+                    return;
+                }
+                m_searchTimer = 1f;
+                Player player = Player.m_localPlayer;
+                m_prey = WorldScan.FindNearestPrey(transform.position, SearchRadius, Catalog.PreyFilter(m_what), player.transform.position, Leash, m_skipTargets);
+                m_preySince = Time.time;
+                m_bestDist = float.MaxValue;
+                m_shotsAtPrey = 0;
+                if (m_prey == null)
+                {
+                    FinishHunt(m_kills == 0 ? (m_what.Length > 0 ? $"{m_what} поблизости не видно" : "дичи поблизости не видно") : "больше дичи поблизости нет");
+                    return;
+                }
+                Debug($"дичь: {m_prey.m_name} в {Vector3.Distance(m_prey.transform.position, transform.position):0} м");
+                return;
+            }
+
+            ItemDrop.ItemData bow = FindBow();
+            if (bow == null || ArrowCount() == 0)
+            {
+                // Лука или стрел нет — по-старому, бегом и топором
+                if (Ai.m_targetCreature != m_prey)
+                {
+                    m_huntUntil = Time.time + 30f;
+                    Ai.m_targetCreature = m_prey;
+                    Ai.m_lastKnownTargetPos = m_prey.transform.position;
+                    Ai.SetAlerted(true);
+                    m_shotsAtPrey = Mathf.Max(m_shotsAtPrey, 1);
+                }
+                return;
+            }
+
+            Vector3 target = m_prey.GetCenterPoint();
+            float dist = Vector3.Distance(target, transform.position);
+            bool sees = dist <= ShootRange && LineOfSight(target);
+            if (!sees)
+            {
+                EndHuntDraw();
+                // Подкрадываемся шагом, издалека бежим; если зверь уходит — не гоняемся вечно
+                Ai.MoveTo(dt, m_prey.transform.position, ShootRange * 0.6f, dist > 45f);
+                if (dist < m_bestDist - 0.5f)
+                {
+                    m_bestDist = dist;
+                    m_stuckTimer = 0f;
+                }
+                else
+                {
+                    m_stuckTimer += dt;
+                }
+                if (m_stuckTimer > 12f || Time.time - m_preySince > 60f || Vector3.Distance(m_prey.transform.position, Player.m_localPlayer.transform.position) > Leash)
+                {
+                    Debug($"упустил {m_prey.m_name}");
+                    m_skipTargets.Add(m_prey.GetZDOID());
+                    m_prey = null;
+                    m_shotsAtPrey = 0;
+                }
+                return;
+            }
+
+            Ai.StopMoving();
+            m_stuckTimer = 0f;
+            if (Humanoid.m_leftItem != bow)
+            {
+                Humanoid.EquipItem(bow, false);
+            }
+            Ai.LookAt(target);
+            if (Humanoid.InAttack() || Time.time < m_nextShot)
+            {
+                return;
+            }
+            // Натягиваем тетиву, как игрок: анимация прицеливания и сила выстрела растут со временем
+            string drawState = bow.m_shared.m_attack.m_drawAnimationState;
+            if (m_drawStart < 0f)
+            {
+                m_drawStart = Time.time;
+            }
+            float drawn = Time.time - m_drawStart;
+            Humanoid.m_attackDrawTime = Mathf.Max(0.01f, drawn * 2.5f);   // ~1 с до полной силы
+            if (!string.IsNullOrEmpty(drawState))
+            {
+                Humanoid.m_zanim.SetBool(drawState, true);
+                Humanoid.m_zanim.SetFloat("drawpercent", Humanoid.GetAttackDrawPercentage());
+            }
+            if (drawn >= 1.0f && Ai.IsLookingAt(target, 8f))
+            {
+                if (Humanoid.StartAttack(null, false))
+                {
+                    m_shotsAtPrey++;
+                    Debug($"выстрел #{m_shotsAtPrey} по {m_prey.m_name} с {dist:0} м");
+                }
+                EndHuntDraw();
+                m_nextShot = Time.time + 0.6f;
+                if (m_shotsAtPrey > 15)
+                {
+                    m_skipTargets.Add(m_prey.GetZDOID());
+                    m_prey = null;
+                    m_shotsAtPrey = 0;
+                }
+            }
+        }
+
+        private void EndHuntDraw()
+        {
+            if (m_drawStart < 0f || Humanoid == null)
+            {
+                return;
+            }
+            m_drawStart = -1f;
+            Humanoid.m_attackDrawTime = 0f;
+            ItemDrop.ItemData bow = FindBow();
+            string drawState = bow != null ? bow.m_shared.m_attack.m_drawAnimationState : "";
+            if (!string.IsNullOrEmpty(drawState))
+            {
+                Humanoid.m_zanim.SetBool(drawState, false);
+            }
+        }
+
+        private static int s_losMask;
+
+        private bool LineOfSight(Vector3 target)
+        {
+            if (s_losMask == 0)
+            {
+                s_losMask = LayerMask.GetMask("Default", "static_solid", "terrain", "piece");
+            }
+            Vector3 eye = Humanoid.m_eye != null ? Humanoid.m_eye.position : transform.position + Vector3.up * 1.6f;
+            return !Physics.Linecast(eye, target, s_losMask, QueryTriggerInteraction.Ignore);
+        }
+
+        private void FinishHunt(string note)
+        {
+            EndHuntDraw();
+            string killed = m_killed.Count > 0 ? string.Join(", ", m_killed.Select(kv => $"{kv.Key} ×{kv.Value}")) : "";
+            string gained = Gained();
+            string result = killed.Length > 0 ? $"охота: добыл {killed}" : "охота: никого не добыл";
+            if (gained.Length > 0)
+            {
+                result += $", подобрал: {gained}";
+            }
+            if (note.Length > 0)
+            {
+                result += $" ({note})";
+            }
+            if (FindBow() != null && ArrowCount() == 0)
+            {
+                result += "; стрелы кончились";
+            }
+            Finish(result);
+        }
+
+        // ---------- Сундук Бьёрна ----------
+
+        private void UpdateChest(float dt, Player player)
+        {
+            m_taskTimeLeft -= dt;
+            if (m_chest == null)
+            {
+                m_chest = WorldScan.FindChest(transform.position, player.transform.position, 90f);
+                m_bestDist = float.MaxValue;
+                m_stuckTimer = 0f;
+                if (m_chest == null)
+                {
+                    Finish(CurrentMode == Mode.Store
+                        ? "сундука Бьёрна рядом нет — сложить не во что"
+                        : "сундука Бьёрна рядом нет — взять неоткуда");
+                    return;
+                }
+            }
+            Vector3 pos = m_chest.transform.position;
+            float dist = Utils.DistanceXZ(pos, transform.position);
+            if (m_chestPhaseAt < 0f)
+            {
+                if (dist < m_bestDist - 0.25f)
+                {
+                    m_bestDist = dist;
+                    m_stuckTimer = 0f;
+                }
+                else
+                {
+                    m_stuckTimer += dt;
+                }
+                if (dist > 2f && !(dist < 3.5f && m_stuckTimer > 2f))
+                {
+                    Ai.MoveTo(dt, pos, 1.2f, dist > 8f);
+                    if (m_stuckTimer > 10f || m_taskTimeLeft <= 0f)
+                    {
+                        Finish("не смог дойти до сундука");
+                    }
+                    return;
+                }
+                // Дошёл: открыть крышку
+                Ai.StopMoving();
+                m_chestPhaseAt = Time.time;
+                m_chestOpenedByMe = !m_chest.IsInUse();
+                if (m_chestOpenedByMe)
+                {
+                    m_chest.SetInUse(true);
+                }
+                Humanoid.m_zanim.SetTrigger("interact");
+            }
+            Ai.StopMoving();
+            Ai.LookAt(pos + Vector3.up * 0.5f);
+            if (Time.time - m_chestPhaseAt < 0.8f)
+            {
+                return;
+            }
+            string result = CurrentMode == Mode.Store ? StoreItems() : FetchItems();
+            Finish(result);
+        }
+
+        private string StoreItems()
+        {
+            Inventory mine = Humanoid.GetInventory();
+            Inventory chest = m_chest.GetInventory();
+            var stored = new Dictionary<string, int>();
+            var left = new Dictionary<string, int>();
+            foreach (ItemDrop.ItemData item in GatheredItems(m_itemFilter, m_what).ToList())
+            {
+                string name = Localization.instance.Localize(item.m_shared.m_name);
+                int stack = item.m_stack;
+                mine.RemoveItem(item);
+                bool all = chest.AddItem(item);
+                int moved = all ? stack : stack - item.m_stack;
+                if (!all)
+                {
+                    mine.AddItem(item);   // не влезло — остаётся при себе
+                    left[name] = (left.TryGetValue(name, out int l) ? l : 0) + item.m_stack;
+                }
+                if (moved > 0)
+                {
+                    stored[name] = (stored.TryGetValue(name, out int n) ? n : 0) + moved;
+                }
+            }
+            string text = stored.Count > 0 ? "сложил в сундук: " + Join(stored) : "в сундук ничего не влезло";
+            if (left.Count > 0)
+            {
+                text += "; не влезло (сундук полон): " + Join(left);
+            }
+            return text;
+        }
+
+        private string FetchItems()
+        {
+            Inventory mine = Humanoid.GetInventory();
+            Inventory chest = m_chest.GetInventory();
+            int want = m_goal > 0 ? m_goal : int.MaxValue;
+            var taken = new Dictionary<string, int>();
+            foreach (ItemDrop.ItemData item in chest.GetAllItems().Where(m_itemFilter).ToList())
+            {
+                if (want <= 0)
+                {
+                    break;
+                }
+                string name = Localization.instance.Localize(item.m_shared.m_name);
+                int take = Mathf.Min(want, item.m_stack);
+                ItemDrop.ItemData moving;
+                if (take >= item.m_stack)
+                {
+                    chest.RemoveItem(item);
+                    moving = item;
+                }
+                else
+                {
+                    moving = item.Clone();
+                    moving.m_stack = take;
+                    chest.RemoveItem(item, take);
+                }
+                if (!mine.AddItem(moving))
+                {
+                    take -= moving.m_stack;
+                    chest.AddItem(moving);   // не унести — обратно
+                }
+                if (take > 0)
+                {
+                    taken[name] = (taken.TryGetValue(name, out int n) ? n : 0) + take;
+                    want -= take;
+                }
+            }
+            if (taken.Count == 0)
+            {
+                return $"в сундуке не нашлось «{m_what}»";
+            }
+            string text = "взял из сундука: " + Join(taken);
+            if (m_goal > 0 && want > 0 && want != int.MaxValue)
+            {
+                text += $" (просили {m_goal}, больше не было)";
+            }
+            return text;
+        }
+
+        private static string Join(Dictionary<string, int> counts)
+        {
+            return string.Join(", ", counts.Select(kv => $"{kv.Key} ×{kv.Value}"));
+        }
+
+        // ---------- Сбор вещей с земли ----------
 
         private enum LootState { Busy, Waiting, Nothing }
 
@@ -498,7 +1272,8 @@ namespace VikingCompanion
             LootState state = StepLoot(dt, LootRadius);
             if (state == LootState.Nothing || m_taskTimeLeft <= 0f)
             {
-                Finish("loot_done");
+                string gained = Gained();
+                Finish(gained.Length > 0 ? "подобрал с земли: " + gained : "подбирать было нечего");
                 return;
             }
             if (state == LootState.Waiting)
@@ -558,7 +1333,7 @@ namespace VikingCompanion
         {
             ItemDrop best = null;
             float bestDist = radius;
-            Vector3 center = CurrentMode == Mode.Loot ? m_workOrigin : transform.position;
+            Vector3 center = m_lootAroundCenter ? m_lootCenter : transform.position;
             foreach (ItemDrop drop in ItemDrop.s_instances)
             {
                 if (drop == null)
@@ -600,8 +1375,7 @@ namespace VikingCompanion
             Ai.StopMoving();
             Ai.LookAt(player.GetHeadPoint());
             string summary = GiveAll(player);
-            CompanionManager.OnTaskFinished(this, string.IsNullOrEmpty(summary) ? "give_empty" : "gave", summary);
-            SetMode(Mode.Follow);
+            Finish(summary.Length > 0 ? "отдал побратиму: " + summary : "отдавать было нечего");
         }
 
         private string GiveAll(Player player)
@@ -609,7 +1383,7 @@ namespace VikingCompanion
             Inventory mine = Humanoid.GetInventory();
             Inventory theirs = player.GetInventory();
             var given = new Dictionary<string, int>();
-            foreach (ItemDrop.ItemData item in GatheredItems().ToList())
+            foreach (ItemDrop.ItemData item in GatheredItems(m_itemFilter, m_what).ToList())
             {
                 int stack = item.m_stack;
                 mine.RemoveItem(item);
@@ -625,22 +1399,58 @@ namespace VikingCompanion
             {
                 return "";
             }
-            string text = string.Join(", ", given.Select(kv => $"{kv.Key} ×{kv.Value}"));
+            string text = Join(given);
             player.Message(MessageHud.MessageType.TopLeft, $"{Name} передал: {text}");
             return text;
         }
 
-        // ---------- Снаряжение ----------
+        // ---------- Снаряжение и добыча в мешке ----------
 
-        private IEnumerable<ItemDrop.ItemData> GatheredItems()
+        // Добыча — всё, кроме снаряжения. Свои стрелы он отдаёт, только если просят именно стрелы, и оставляет себе колчан.
+        private IEnumerable<ItemDrop.ItemData> GatheredItems(System.Func<ItemDrop.ItemData, bool> filter, string what)
         {
-            return Humanoid.GetInventory().GetAllItems().Where(i => !IsKit(i));
+            bool arrowsAsked = !Catalog.IsAll(what) && filter != null;
+            int keepArrows = CompanionPrefab.KitArrowCount;
+            foreach (ItemDrop.ItemData item in Humanoid.GetInventory().GetAllItems().ToList())
+            {
+                if (IsKit(item) || (filter != null && !filter(item)))
+                {
+                    continue;
+                }
+                if (IsArrow(item))
+                {
+                    if (!arrowsAsked || keepArrows >= item.m_stack)
+                    {
+                        keepArrows -= item.m_stack;
+                        continue;
+                    }
+                    if (keepArrows > 0)
+                    {
+                        // Часть пачки остаётся в колчане
+                        int give = item.m_stack - keepArrows;
+                        keepArrows = 0;
+                        ItemDrop.ItemData part = item.Clone();
+                        part.m_stack = give;
+                        Humanoid.GetInventory().RemoveItem(item, give);
+                        Humanoid.GetInventory().AddItem(part);
+                        yield return part;
+                        continue;
+                    }
+                }
+                yield return item;
+            }
         }
 
         private bool IsKit(ItemDrop.ItemData item)
         {
             return Humanoid.IsItemEquiped(item)
-                || (CompanionPrefab.IsKitItem(item) && (item.IsWeapon() || item.m_shared.m_itemType == ItemDrop.ItemData.ItemType.Shield));
+                || (CompanionPrefab.IsKitItem(item) && (item.IsWeapon() || item.m_shared.m_itemType == ItemDrop.ItemData.ItemType.Shield
+                    || item.m_shared.m_itemType == ItemDrop.ItemData.ItemType.Bow));
+        }
+
+        private static bool IsArrow(ItemDrop.ItemData item)
+        {
+            return item.m_shared.m_itemType == ItemDrop.ItemData.ItemType.Ammo && item.m_shared.m_ammoType == "$ammo_arrows";
         }
 
         // Вызывается каждый кадр работы — без LINQ, чтобы не мусорить в память
@@ -649,12 +1459,49 @@ namespace VikingCompanion
             int sum = 0;
             foreach (ItemDrop.ItemData item in Humanoid.GetInventory().GetAllItems())
             {
-                if (!IsKit(item))
+                if (!IsKit(item) && !IsArrow(item))
                 {
                     sum += item.m_stack;
                 }
             }
             return sum;
+        }
+
+        private Dictionary<string, int> Snapshot()
+        {
+            var counts = new Dictionary<string, int>();
+            foreach (ItemDrop.ItemData item in Humanoid.GetInventory().GetAllItems())
+            {
+                counts[item.m_shared.m_name] = (counts.TryGetValue(item.m_shared.m_name, out int n) ? n : 0) + item.m_stack;
+            }
+            return counts;
+        }
+
+        // Что прибавилось в мешке с начала дела: «Древесина ×42, Смола ×1»
+        private string Gained()
+        {
+            var now = Snapshot();
+            var parts = new List<string>();
+            foreach (KeyValuePair<string, int> kv in now)
+            {
+                int before = m_snapshot.TryGetValue(kv.Key, out int n) ? n : 0;
+                if (kv.Value > before)
+                {
+                    parts.Add($"{Localization.instance.Localize(kv.Key)} ×{kv.Value - before}");
+                }
+            }
+            return string.Join(", ", parts);
+        }
+
+        private void FinishGathering(string verb, string note)
+        {
+            string gained = Gained();
+            string result = gained.Length > 0 ? $"{verb}: {gained}" : $"{verb}: ничего";
+            if (note.Length > 0)
+            {
+                result += $" ({note})";
+            }
+            Finish(result);
         }
 
         private ItemDrop.ItemData FindTool(Skills.SkillType skill)
@@ -669,6 +1516,53 @@ namespace VikingCompanion
             return null;
         }
 
+        public ItemDrop.ItemData FindBow()
+        {
+            foreach (ItemDrop.ItemData item in Humanoid.GetInventory().GetAllItems())
+            {
+                if (item.m_shared.m_itemType == ItemDrop.ItemData.ItemType.Bow && item.m_shared.m_ammoType == "$ammo_arrows")
+                {
+                    PrepareBow(item);
+                    return item;
+                }
+            }
+            return null;
+        }
+
+        public int ArrowCount()
+        {
+            int sum = 0;
+            foreach (ItemDrop.ItemData item in Humanoid.GetInventory().GetAllItems())
+            {
+                if (IsArrow(item))
+                {
+                    sum += item.m_stack;
+                }
+            }
+            return sum;
+        }
+
+        // Ванильный ИИ стреляет, только подойдя на m_aiAttackRange (у луков игрока это 2 м).
+        // Лучу Бьёрна даём свою копию общих данных с дальностью лучника — луки игрока не меняются.
+        private static readonly HashSet<ItemDrop.ItemData.SharedData> s_tunedShared = new HashSet<ItemDrop.ItemData.SharedData>();
+
+        private static void PrepareBow(ItemDrop.ItemData bow)
+        {
+            if (s_tunedShared.Contains(bow.m_shared))
+            {
+                return;
+            }
+            var copy = (ItemDrop.ItemData.SharedData)typeof(object)
+                .GetMethod("MemberwiseClone", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                .Invoke(bow.m_shared, null);
+            copy.m_aiAttackRange = 24f;
+            copy.m_aiAttackRangeMin = 0f;
+            copy.m_aiAttackInterval = 1.6f;
+            copy.m_aiAttackMaxAngle = 6f;
+            bow.m_shared = copy;
+            s_tunedShared.Add(copy);
+        }
+
         private ItemDrop.ItemData FindShield()
         {
             foreach (ItemDrop.ItemData item in Humanoid.GetInventory().GetAllItems())
@@ -681,15 +1575,28 @@ namespace VikingCompanion
             return null;
         }
 
-        public void EquipCombat()
+        // В бою: топор со щитом; если велено биться луком — лук, пока враг не подошёл вплотную
+        public void EquipCombat(Character target = null)
         {
+            if (PrefersBow && (target == null || Vector3.Distance(target.transform.position, transform.position) > 7f))
+            {
+                ItemDrop.ItemData bow = FindBow();
+                if (bow != null && ArrowCount() > 0)
+                {
+                    if (Humanoid.m_leftItem != bow)
+                    {
+                        Humanoid.EquipItem(bow, false);
+                    }
+                    return;
+                }
+            }
             ItemDrop.ItemData axe = FindTool(Skills.SkillType.Axes);
             if (axe != null && Humanoid.m_rightItem != axe)
             {
                 Humanoid.EquipItem(axe, false);
             }
             ItemDrop.ItemData shield = FindShield();
-            if (shield != null && Humanoid.m_leftItem == null && (Humanoid.m_rightItem == null || !Humanoid.m_rightItem.IsTwoHanded()))
+            if (shield != null && Humanoid.m_leftItem != shield && (Humanoid.m_rightItem == null || !Humanoid.m_rightItem.IsTwoHanded()))
             {
                 Humanoid.EquipItem(shield, false);
             }
@@ -699,7 +1606,11 @@ namespace VikingCompanion
         {
             if (CurrentWork == WorkKind.Wood)
             {
-                EquipCombat();
+                ItemDrop.ItemData axe = FindTool(Skills.SkillType.Axes);
+                if (axe != null && Humanoid.m_rightItem != axe)
+                {
+                    Humanoid.EquipItem(axe, false);
+                }
                 return;
             }
             ItemDrop.ItemData pickaxe = FindTool(Skills.SkillType.Pickaxes);
@@ -717,7 +1628,7 @@ namespace VikingCompanion
             float bestDist = range;
             foreach (Character c in Character.GetAllCharacters())
             {
-                if (c == Humanoid || c.IsDead() || !BaseAI.IsEnemy(Humanoid, c))
+                if (c == Humanoid || c.IsDead() || c.IsTamed() || !BaseAI.IsEnemy(Humanoid, c))
                 {
                     continue;
                 }
@@ -735,12 +1646,14 @@ namespace VikingCompanion
             return best;
         }
 
-        // Звери не враги, пока сами не нападают; монстры — всегда
+        // Звери не враги, пока сами не нападают; монстры — всегда.
+        // Олени, кабаны и прочая дичь числятся в игре «лесными монстрами» — узнаём их по виду.
         public bool IsThreat(Character c)
         {
-            if (c.GetFaction() != Character.Faction.AnimalsVeg)
+            bool prey = c.GetFaction() == Character.Faction.AnimalsVeg || WorldScan.IsPrey(c, out _);
+            if (!prey)
             {
-                return true;
+                return !c.IsTamed();
             }
             BaseAI ai = c.GetBaseAI();
             Character theirTarget = ai != null ? ai.GetTargetCreature() : null;
@@ -767,8 +1680,9 @@ namespace VikingCompanion
         public string GetHoverText()
         {
             string order = CurrentMode == Mode.Stay ? "За мной" : "Жди здесь";
+            string doing = CurrentMode != Mode.Follow && CurrentMode != Mode.Stay ? $"\n<color=#aaaaaa>{DescribeMode()}</color>" : "";
             return Localization.instance.Localize(
-                $"{Name}\n[<color=yellow><b>$KEY_Use</b></color>] {order}\n<color=#aaaaaa>Говори с ним в чате</color>");
+                $"{Name}{doing}\n[<color=yellow><b>$KEY_Use</b></color>] {order}\n<color=#aaaaaa>Говори с ним в чате или голосом ({Plugin.VoiceKey.Value})</color>");
         }
 
         public bool Interact(Humanoid user, bool hold, bool alt)
@@ -777,6 +1691,7 @@ namespace VikingCompanion
             {
                 return false;
             }
+            CancelPlan();
             SetMode(CurrentMode == Mode.Stay ? Mode.Follow : Mode.Stay);
             CompanionManager.OnOrderByHand(this);
             return true;
@@ -791,21 +1706,15 @@ namespace VikingCompanion
 
         private void OnDeath()
         {
+            EndHuntDraw();
+            CancelPlan();
             // Добыча остаётся на месте гибели, снаряжение — нет
-            foreach (ItemDrop.ItemData item in GatheredItems().ToList())
+            foreach (ItemDrop.ItemData item in GatheredItems(null, "").ToList())
             {
                 ItemDrop.DropItem(item, item.m_stack, transform.position + Vector3.up, Quaternion.identity);
             }
             Humanoid.GetInventory().RemoveAll();
             CompanionManager.OnCompanionDied(this);
-        }
-
-        private void Finish(string reason)
-        {
-            int gathered = CountGathered() - m_startCount;
-            string details = reason.StartsWith("loot") ? m_looted.ToString() : gathered.ToString();
-            SetMode(Mode.Follow);
-            CompanionManager.OnTaskFinished(this, reason, details);
         }
     }
 }

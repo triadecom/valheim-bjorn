@@ -1,8 +1,8 @@
 """Мост между модом VikingCompanion и Claude.
 
-Мод шлёт события и сводку обстановки, мост спрашивает Claude Haiku и возвращает
-реплику и действие компаньона. Реплики озвучиваются (Piper), голос игрока
-распознаётся (Parakeet) — всё локально, кроме самой LLM.
+Мод шлёт события и сводку обстановки, мост спрашивает Claude и возвращает
+реплику и план действий компаньона. Реплики озвучиваются (Silero или Piper), голос игрока
+распознаётся (Parakeet) — всё локально, кроме самой LLM. Память своя для каждого мира.
 Слушает только 127.0.0.1. Завершается сам, когда умирает процесс игры.
 """
 
@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Future
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -26,20 +27,31 @@ import anthropic  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
 import voice  # noqa: E402
+from memory import Memory  # noqa: E402
 
-MODEL = "claude-haiku-5-5"
 STT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 ENV_FILE = BASE_DIR / ".env"
+PROMPTS_DIR = BASE_DIR / "prompts"
 
 DATA_DIR = BASE_DIR / "data"
 VOICES_DIR = DATA_DIR / "voices"
-MEMORY_FILE = DATA_DIR / "memory.json"
+MEMORY_DIR = DATA_DIR / "memory"
+LEGACY_MEMORY_FILE = DATA_DIR / "memory.json"
 LOG_FILE = DATA_DIR / "bridge.log"
 
-HISTORY_IN_PROMPT = 30
-HISTORY_KEPT = 120
+# «Мышление» из настроек: модель и усилие. Быстрый Haiku отвечает голосом почти сразу,
+# вдумчивый дольше рассуждает, Sonnet умнее, но заметно медленнее и дороже.
+THINKING = {
+    "fast": ("claude-haiku-5-5", "low"),
+    "thoughtful": ("claude-haiku-5-5", "medium"),
+    "smart": ("claude-sonnet-5-5", "low"),
+}
+MEMORY_MODEL = "claude-haiku-5-5"
 
-ACTIONS = ["none", "follow", "stay", "come", "attack", "gather_wood", "mine", "loot", "give_items"]
+ACTIONS = ["follow", "stay", "come", "attack", "gather_wood", "mine", "pick", "hunt", "loot",
+           "give_items", "store", "fetch", "combat_style"]
+ActionName = Literal["follow", "stay", "come", "attack", "gather_wood", "mine", "pick", "hunt", "loot",
+                     "give_items", "store", "fetch", "combat_style"]
 
 OUTPUT_SCHEMA = {
     "type": "object",
@@ -48,22 +60,70 @@ OUTPUT_SCHEMA = {
             "type": "string",
             "description": "Что ты говоришь вслух. Пустая строка — промолчать.",
         },
-        "action": {
+        "plan": {
+            "type": "array",
+            "description": "Что ты делаешь после этих слов, по порядку. Пустой список — продолжать своё дело.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "do": {"type": "string", "enum": ACTIONS},
+                    "what": {"type": "string", "description": "Что именно; пустая строка — не важно."},
+                    "count": {"type": "integer", "description": "Сколько; 0 — на твоё усмотрение."},
+                },
+                "required": ["do", "what", "count"],
+                "additionalProperties": False,
+            },
+        },
+        "remember": {
             "type": "string",
-            "enum": ACTIONS,
-            "description": "Что ты делаешь после этих слов.",
+            "description": "Что запомнить надолго, одной фразой. Пустая строка — нечего.",
         },
     },
-    "required": ["say", "action"],
+    "required": ["say", "plan", "remember"],
     "additionalProperties": False,
 }
 
 log = logging.getLogger("bridge")
 
 
+class Step(BaseModel):
+    do: ActionName
+    what: str = ""
+    count: int = 0
+
+
 class Reply(BaseModel):
     say: str
-    action: Literal["none", "follow", "stay", "come", "attack", "gather_wood", "mine", "loot", "give_items"]
+    plan: list[Step] = []
+    remember: str = ""
+
+    def payload(self) -> dict:
+        # action — первый шаг, для старых версий мода
+        return {"say": self.say, "plan": [s.model_dump() for s in self.plan], "action": self.plan[0].do if self.plan else "none"}
+
+
+@dataclass
+class Settings:
+    """То, что игрок настраивает на вкладке «Бьёрн» в настройках игры."""
+    name: str = "Бьёрн"
+    role: str = "viking"            # viking, skald, mentor, jester, friend, custom
+    role_custom: str = ""           # своё описание характера
+    length: str = "short"           # short, normal, long
+    humor: int = 50                 # 0..100
+    rudeness: int = 50              # 0..100
+    chattiness: str = "normal"      # quiet, normal, chatty
+    thinking: str = "fast"          # fast, thoughtful, smart
+    memory: bool = True             # учиться и помнить
+    tts: bool = True
+    voice: str = "aidar"
+    tone: str = "low"
+    tempo: str = "medium"
+    volume: float = 1.0
+    fillers: bool = True
+    extra: dict = field(default_factory=dict)
+
+    def model(self) -> tuple[str, str]:
+        return THINKING.get(self.thinking, THINKING["fast"])
 
 
 def read_env_file(path: Path, wanted: set[str]) -> dict[str, str]:
@@ -112,22 +172,38 @@ def load_api_key() -> str:
 LOG_STATE = os.environ.get("VCOMP_LOG_STATE") == "1"
 
 
+def _near_list(items: list | None, unit: str = "") -> str:
+    parts = []
+    for it in (items or [])[:8]:
+        where = f", ближ. {it.get('nearest', 0):.0f} м {it.get('where', '')}".rstrip() if it.get("nearest") is not None else ""
+        parts.append(f"{it.get('name')} ×{it.get('count', 0)}{unit}{where}")
+    return "; ".join(parts)
+
+
 def render_state(state: dict, name: str) -> str:
     player = state.get("player_name") or "побратим"
     lines = [
         f"День {state.get('day', '?')}, {state.get('time_of_day', '?')}, погода: {state.get('weather') or 'обычная'}.",
-        f"Земли: {state.get('biome') or 'неизвестно'}{'; ' + state['location'] if state.get('location') else ''}.",
+        f"Земли: {state.get('biome') or 'неизвестно'}{'; ' + state['location'] if state.get('location') else ''}."
+        + (f" Дом побратима (кровать): {state['home']}." if state.get("home") else ""),
         (
             f"{player}: здоровье {state.get('player_hp', 0):.0f}/{state.get('player_hp_max', 0):.0f}, "
             f"груз {state.get('player_weight', 0):.0f}/{state.get('player_weight_max', 0):.0f}, "
-            f"в руках: {state.get('player_weapon') or 'ничего'}."
-        ),
-        (
-            f"{name}: здоровье {state.get('companion_hp', 0):.0f}/{state.get('companion_hp_max', 0):.0f}, "
-            f"сейчас: {state.get('companion_mode') or 'идёт следом'}, "
-            f"несёт: {state.get('companion_carry') or 'ничего'}."
+            f"в руках: {state.get('player_weapon') or 'ничего'}, сытных блюд съедено: {state.get('player_foods', 0)} из 3."
         ),
     ]
+    if state.get("player_items"):
+        lines.append(f"В мешке у {player}: {state['player_items']}.")
+    plan = f", дальше по плану: {state['companion_plan']}" if state.get("companion_plan") else ""
+    arrows = state.get("companion_arrows", 0)
+    weapons = f"бьётся: {state.get('companion_style') or 'топором и щитом'}"
+    if state.get("companion_bow"):
+        weapons += f"; лук {state['companion_bow']}, стрел {arrows}"
+    lines.append(
+        f"{name}: здоровье {state.get('companion_hp', 0):.0f}/{state.get('companion_hp_max', 0):.0f}, "
+        f"сейчас: {state.get('companion_mode') or 'идёт следом'}{plan}; {weapons}; "
+        f"несёт: {state.get('companion_carry') or 'ничего'}."
+    )
     enemies = state.get("enemies") or []
     if enemies:
         parts = [f"{e.get('name')} ({e.get('distance', 0):.0f} м)" for e in enemies[:6]]
@@ -138,34 +214,144 @@ def render_state(state: dict, name: str) -> str:
     trees, rocks = state.get("trees_near", 0), state.get("rocks_near", 0)
     lines.append(
         f"В округе (до 70 м): деревьев {trees}{' (' + state['trees_where'] + ')' if trees and state.get('trees_where') else ''}, "
-        f"камней {rocks}{' (' + state['rocks_where'] + ')' if rocks and state.get('rocks_where') else ''}; "
+        f"камней и руды {rocks}{' (' + state['rocks_where'] + ')' if rocks and state.get('rocks_where') else ''}; "
         f"вещей на земле рядом {state.get('items_near', 0)}."
     )
+    plants = _near_list(state.get("plants"))
+    lines.append(f"Растения и находки рядом: {plants}." if plants else "Ягод, грибов и трав рядом не видно.")
+    animals = _near_list(state.get("animals"))
+    lines.append(f"Дичь рядом: {animals}." if animals else "Дичи рядом не видно.")
+    chests = state.get("chests") or []
+    if chests:
+        for ch in chests[:2]:
+            contents = ch.get("contents") or "пусто"
+            lines.append(f"Сундук Бьёрна в {ch.get('distance', 0):.0f} м {ch.get('where', '')}: {contents} "
+                         f"(занято ячеек {ch.get('used', 0)} из {ch.get('total', 0)}).")
+    else:
+        lines.append("Сундука Бьёрна поблизости нет.")
     return "\n".join(lines)
 
 
+def read_prompt(name: str) -> str:
+    text = (PROMPTS_DIR / name).read_text(encoding="utf-8")
+    if text.startswith("---"):
+        text = text.split("---", 2)[2]   # заголовок с названием роли — для людей
+    return text.strip()
+
+
+ROLES = ["viking", "skald", "mentor", "jester", "friend", "custom"]
+
+LENGTH = {
+    "short": "Говори коротко: одна-две фразы, обычно до 20 слов. Это слова в пути и в бою, а не сага.",
+    "normal": "Говори коротко, но не односложно: две-три фразы, до 40 слов.",
+    "long": "Можешь говорить развёрнуто: до пяти фраз, если есть что сказать. На простые вопросы и в бою — коротко.",
+}
+
+CHATTINESS = {
+    "quiet": "Ты молчалив. На события откликайся, только если это действительно важно: опасность, рана, итог дела. Иначе say — пустая строка.",
+    "normal": "",
+    "chatty": "Ты разговорчив: охотно откликаешься на события, вспоминаешь былое, сам расспрашиваешь побратима о планах.",
+}
+
+
+def scale(value: int, low: str, mid: str, high: str, top: str) -> str:
+    if value < 25:
+        return low
+    if value < 60:
+        return mid
+    if value < 85:
+        return high
+    return top
+
+
+def build_style(cfg: Settings) -> str:
+    lines = ["# Манера (настроил побратим)", LENGTH.get(cfg.length, LENGTH["short"])]
+    lines.append(scale(cfg.humor, "Шутишь редко, держишься серьёзно.", "Шутишь иногда, к месту.",
+                       "Шутишь часто.", "Шутишь постоянно, балагуришь при любом случае."))
+    lines.append(scale(cfg.rudeness, "Говоришь мягко и по-доброму, без грубостей.", "Прям и порой резковат, но не груб.",
+                       "Грубоват и дерзок, любишь поддеть побратима.",
+                       "Груб и язвителен на словах (но без мата), хотя в деле верен до конца."))
+    if CHATTINESS.get(cfg.chattiness):
+        lines.append(CHATTINESS[cfg.chattiness])
+    return "\n".join(lines)
+
+
+def build_system(cfg: Settings) -> str:
+    role = cfg.role if cfg.role in ROLES else "viking"
+    parts = [read_prompt(f"roles/{role}.md")]
+    custom = " ".join(cfg.role_custom.split())[:1500]
+    if custom:
+        parts.append("# Каким тебя хочет видеть побратим\n" + custom
+                     + "\nЭто описание важнее общих слов о характере выше, если они расходятся.")
+    parts += [build_style(cfg), read_prompt("rules.md"), read_prompt("lore.md")]
+    return "\n\n".join(parts).replace("{name}", cfg.name)
+
+
+def plan_text(plan: list[Step]) -> str:
+    out = []
+    for step in plan:
+        item = step.do
+        if step.what:
+            item += f" «{step.what}»"
+        if step.count:
+            item += f" ×{step.count}"
+        out.append(item)
+    return ", ".join(out)
+
+
 class Brain:
-    def __init__(self, name: str, persist: bool = True):
-        self.name = name
-        self.persist = persist
-        self.system = (BASE_DIR / "persona.md").read_text(encoding="utf-8").replace("{name}", name)
-        self.client = anthropic.Anthropic(api_key=load_api_key(), timeout=25.0, max_retries=1)
+    def __init__(self, cfg: Settings, persist: bool = True, memory_dir: Path | None = None):
+        self.cfg = cfg
+        self.client = anthropic.Anthropic(api_key=load_api_key(), timeout=30.0, max_retries=1)
         self.lock = threading.Lock()
-        self.history: list[str] = self._load_history() if persist else []
+        # Своя папка памяти (тесты) — без переноса старой общей памяти
+        self.memory = Memory(memory_dir, None) if memory_dir else Memory(MEMORY_DIR, LEGACY_MEMORY_FILE)
+        self.memory.persist = persist
+        self.memory.enabled = cfg.memory
+        self.system = build_system(cfg)
         self.speaker: voice.Speaker | None = None
-        self.fillers = True
+        self.voice_loader = None   # функция, которая пересобирает голос по настройкам
 
-    def _load_history(self) -> list[str]:
-        try:
-            data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-            return [str(x) for x in data.get("history", [])][-HISTORY_KEPT:]
-        except (OSError, ValueError):
-            return []
+    @property
+    def name(self) -> str:
+        return self.cfg.name
 
-    def _save_history(self) -> None:
-        tmp = MEMORY_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"history": self.history}, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(MEMORY_FILE)
+    @property
+    def fillers(self) -> bool:
+        return self.cfg.fillers and self.cfg.tts
+
+    def configure(self, changes: dict) -> dict:
+        """Новые настройки из игры. Голос пересобирается в фоне, характер — сразу."""
+        with self.lock:
+            old = self.cfg
+            data = asdict(old)
+            for key, value in changes.items():
+                if key in data and key != "extra" and value is not None:
+                    try:
+                        data[key] = type(data[key])(value)
+                    except (TypeError, ValueError):
+                        log.warning("настройка %s=%r не подошла", key, value)
+            self.cfg = Settings(**data)
+            self.system = build_system(self.cfg)
+            self.memory.enabled = self.cfg.memory
+            cfg = self.cfg
+        if self.speaker:
+            self.speaker.volume = cfg.volume
+        voice_changed = (old.voice, old.tone, old.tempo) != (cfg.voice, cfg.tone, cfg.tempo) \
+            or (cfg.tts and self.speaker is None)
+        if voice_changed and self.voice_loader:
+            threading.Thread(target=self.voice_loader, args=(cfg,), daemon=True).start()
+        if cfg != old:
+            model, effort = cfg.model()
+            log.info("настройки: роль %s, длина %s, юмор %d, резкость %d, болтливость %s, %s/%s, память %s, голос %s%s",
+                     cfg.role, cfg.length, cfg.humor, cfg.rudeness, cfg.chattiness, model, effort,
+                     "вкл" if cfg.memory else "выкл", cfg.voice if cfg.tts else "выкл",
+                     f", своя роль {len(cfg.role_custom)} зн." if cfg.role_custom else "")
+        return {"ok": True}
+
+    def _select_memory(self, state: dict) -> None:
+        if state.get("world") or state.get("player_name"):
+            self.memory.select(state.get("world", ""), state.get("player_name", ""))
 
     def _incoming(self, kind: str, text: str, player: str) -> tuple[str, str]:
         if kind == "chat":
@@ -175,30 +361,39 @@ class Brain:
                     f"{player}: {text}")
         return f"Событие: {text}", f"[{text}]"
 
+    def _system_blocks(self) -> list[dict]:
+        # Роль, манера, правила и знания не меняются от реплики к реплике — их кэширует API.
+        # Память меняется только после размышлений — отдельный блок со своей точкой кэша.
+        with self.lock:
+            blocks = [{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}]
+        remembered = self.memory.prompt_block()
+        if remembered:
+            blocks.append({"type": "text", "text": remembered, "cache_control": {"type": "ephemeral"}})
+        return blocks
+
     def respond(self, kind: str, text: str, state: dict, speak: bool = True, commit: bool = True) -> Reply:
-        """Спрашивает Haiku потоком; законченные предложения сразу уходят в речь."""
+        """Спрашивает Claude потоком; законченные предложения сразу уходят в речь."""
+        self._select_memory(state)
         player = state.get("player_name") or "Побратим"
         incoming, _ = self._incoming(kind, text, player)
         if LOG_STATE:
             log.info("state for %s: %s", kind, json.dumps(state, ensure_ascii=False))
-        with self.lock:
-            history = "\n".join(self.history[-HISTORY_IN_PROMPT:]) or "(пока ничего)"
         user = (
-            f"<history>\n{history}\n</history>\n\n"
+            f"<history>\n{self.memory.recent()}\n</history>\n\n"
             f"<state>\n{render_state(state, self.name)}\n</state>\n\n"
             f"<now>\n{incoming}\n</now>"
         )
-
-        speaker = self.speaker if speak else None
+        model, effort = self.cfg.model()
+        speaker = self.speaker if speak and self.cfg.tts else None
         feeder = voice.SentenceFeeder(speaker.say) if speaker else None
         started = time.monotonic()
         first_audio = None
         raw = ""
         with self.client.messages.stream(
-            model=MODEL,
-            max_tokens=1024,
-            system=self.system,
-            output_config={"effort": "low", "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
+            model=model,
+            max_tokens=2048,
+            system=self._system_blocks(),
+            output_config={"effort": effort, "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
             messages=[{"role": "user", "content": user}],
         ) as stream:
             for delta in stream.text_stream:
@@ -214,43 +409,50 @@ class Brain:
 
         if response.stop_reason == "refusal":
             log.warning("refusal (%s) request_id=%s", getattr(response.stop_details, "category", None), response._request_id)
-            reply = Reply(say="", action="none")
+            reply = Reply(say="")
         else:
             try:
                 reply = Reply.model_validate_json(raw)
             except ValidationError:
-                log.warning("bad output stop=%s body=%r request_id=%s", response.stop_reason, raw[:200], response._request_id)
-                reply = Reply(say="", action="none")
+                log.warning("bad output stop=%s body=%r request_id=%s", response.stop_reason, raw[:300], response._request_id)
+                reply = Reply(say="")
         reply.say = " ".join(reply.say.split())
         if feeder:
             said, _ = voice.say_prefix(raw)
             feeder.feed(said, True)   # договорить хвост без точки в конце
+        usage = response.usage
         log.info(
-            "%s %r -> say=%r action=%s | %.1fs (речь с %.1fs) in=%d out=%d%s",
-            kind, text, reply.say, reply.action, elapsed, first_audio or 0,
-            response.usage.input_tokens, response.usage.output_tokens, "" if commit else " [упреждающий]",
+            "%s %r -> say=%r plan=[%s]%s | %s %.1fs (речь с %.1fs) in=%d cache r/w=%d/%d out=%d%s",
+            kind, text, reply.say, plan_text(reply.plan), f" remember={reply.remember!r}" if reply.remember else "",
+            model, elapsed, first_audio or 0, usage.input_tokens, usage.cache_read_input_tokens or 0,
+            usage.cache_creation_input_tokens or 0, usage.output_tokens, "" if commit else " [упреждающий]",
         )
         if commit:
             self.commit(kind, text, state, reply)
         return reply
 
     def commit(self, kind: str, text: str, state: dict, reply: Reply) -> None:
+        self._select_memory(state)
         _, history_line = self._incoming(kind, text, state.get("player_name") or "Побратим")
-        with self.lock:
-            self.history.append(history_line)
-            if reply.say:
-                self.history.append(f"{self.name}: {reply.say}")
-            if reply.action != "none":
-                self.history.append(f"[{self.name}: {reply.action}]")
-            self.history = self.history[-HISTORY_KEPT:]
-            if self.persist:
-                self._save_history()
+        lines = [history_line]
+        if reply.say:
+            lines.append(f"{self.name}: {reply.say}")
+        if reply.plan:
+            lines.append(f"[{self.name}: план — {plan_text(reply.plan)}]")
+        self.memory.add_lines(lines)
+        if reply.remember:
+            self.memory.remember(reply.remember)
+        self.memory.maybe_reflect(self.client, MEMORY_MODEL, self.name)
+
+    def note(self, text: str, state: dict) -> None:
+        self._select_memory(state)
+        self.memory.note(text, state.get("day"))
+        self.memory.maybe_reflect(self.client, MEMORY_MODEL, self.name)
 
     def speak(self, text: str) -> None:
-        if self.speaker:
+        if self.speaker and self.cfg.tts:
             for sentence in voice.SentenceFeeder.split(text):
                 self.speaker.say(sentence)
-
 
 class VoiceSession:
     """Нажатие R: запись, распознавание по ходу речи и упреждающий ответ на паузах."""
@@ -387,14 +589,14 @@ class VoiceSession:
         t0 = time.monotonic()
         with self._lock:
             if not self._recording:
-                return {"transcript": "", "say": "", "action": "none", "error": "not_recording"}
+                return {"transcript": "", "say": "", "plan": [], "error": "not_recording"}
             self._recording = False
             audio = self.recorder.stop()
         if self._worker:
             self._worker.join(timeout=2)
         if len(audio) == 0 or float(abs(audio).max()) < 1e-4:
             # Сплошные нули — macOS не дала доступ к микрофону
-            return {"transcript": "", "say": "", "action": "none", "error": "no_mic"}
+            return {"transcript": "", "say": "", "plan": [], "error": "no_mic"}
         # После последнего промежуточного распознавания была только тишина — оно и есть итог
         tail = audio[self._partial_samples:]
         if self.partial and len(tail) < voice.SAMPLE_RATE * 1.5 and (len(tail) == 0 or float(abs(tail).max()) < 0.02):
@@ -403,12 +605,12 @@ class VoiceSession:
             text = self.stt.transcribe(audio)
         stt_ms = (time.monotonic() - t0) * 1000
         if not text:
-            return {"transcript": "", "say": "", "action": "none", "error": "silence"}
+            return {"transcript": "", "say": "", "plan": [], "error": "silence"}
 
         spec_hit = False
         reply = None
         # Пока говорил, обстановка изменилась (нарубил, начался бой) — заготовка устарела
-        stale = any(self._spec_state.get(k) != state.get(k) for k in ("companion_carry", "companion_mode")) \
+        stale = any(self._spec_state.get(k) != state.get(k) for k in ("companion_carry", "companion_mode", "companion_plan")) \
             or bool(self._spec_state.get("enemies")) != bool(state.get("enemies"))
         if self._spec is not None and voice.similar(self._spec_text, text) and not stale:
             try:
@@ -430,8 +632,11 @@ class VoiceSession:
                  "макс %.0f мс, первый текст через %.1f с",
                  text, stt_ms, total_ms, " (угадан заранее)" if spec_hit else "",
                  len(self._stt_times), sum(times) / len(times) * 1000, max(times) * 1000, self._first_text_at)
-        return {"transcript": text, "say": reply.say, "action": reply.action, "error": "",
+        return {"transcript": text, **reply.payload(), "error": "",
                 "stt_ms": stt_ms, "total_ms": total_ms, "speculative": spec_hit}
+
+
+ERROR_REPLY = {"say": "", "plan": [], "action": "none"}
 
 
 def make_handler(brain: Brain, session: VoiceSession):
@@ -448,12 +653,21 @@ def make_handler(brain: Brain, session: VoiceSession):
             length = int(self.headers.get("Content-Length", "0"))
             return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
+        def _memory_info(self) -> dict:
+            mem = brain.memory
+            with mem.lock:
+                return {"world": mem.world, "player": mem.player, "facts": [f["text"] for f in mem.facts],
+                        "summary": mem.summary, "history": len(mem.history), "enabled": mem.enabled}
+
         def do_GET(self):
             if self.path == "/health":
-                self._send(200, {"ok": True, "model": MODEL, "name": brain.name,
+                model, effort = brain.cfg.model()
+                self._send(200, {"ok": True, "model": model, "effort": effort, "name": brain.name,
                                  "voice": session.ready, "tts": brain.speaker is not None})
             elif self.path == "/v1/voice/partial":
                 self._send(200, session.partial_info())
+            elif self.path == "/v1/memory":
+                self._send(200, self._memory_info())
             else:
                 self._send(404, {"error": "not found"})
 
@@ -464,7 +678,20 @@ def make_handler(brain: Brain, session: VoiceSession):
                     if req.get("kind") == "chat" and brain.speaker:
                         brain.speaker.stop()  # написал в чат — перебил
                     reply = brain.respond(str(req.get("kind", "event")), str(req.get("text", "")), req.get("state") or {})
-                    self._send(200, {"say": reply.say, "action": reply.action, "error": ""})
+                    self._send(200, {**reply.payload(), "error": ""})
+                elif self.path == "/v1/note":
+                    brain.note(str(req.get("text", "")), req.get("state") or {})
+                    self._send(200, {"ok": True})
+                elif self.path == "/v1/config":
+                    self._send(200, brain.configure(req))
+                elif self.path == "/v1/memory":
+                    state = req.get("state") or {}
+                    brain._select_memory(state)
+                    self._send(200, self._memory_info())
+                elif self.path == "/v1/memory/forget":
+                    brain._select_memory(req.get("state") or {})
+                    brain.memory.forget()
+                    self._send(200, {"ok": True})
                 elif self.path == "/v1/voice/start":
                     self._send(200, session.start(req.get("state") or {}, str(req.get("test_audio", ""))))
                 elif self.path == "/v1/voice/stop":
@@ -482,16 +709,16 @@ def make_handler(brain: Brain, session: VoiceSession):
                     self._send(404, {"error": "not found"})
             except anthropic.APIConnectionError:
                 log.warning("no connection to Anthropic API")
-                self._send(200, {"say": "", "action": "none", "error": "connection"})
+                self._send(200, {**ERROR_REPLY, "error": "connection"})
             except anthropic.RateLimitError:
                 log.warning("rate limited")
-                self._send(200, {"say": "", "action": "none", "error": "rate_limit"})
+                self._send(200, {**ERROR_REPLY, "error": "rate_limit"})
             except anthropic.APIStatusError as e:
                 log.error("API error %s: %s", e.status_code, e.message)
-                self._send(200, {"say": "", "action": "none", "error": f"api_{e.status_code}"})
+                self._send(200, {**ERROR_REPLY, "error": f"api_{e.status_code}"})
             except Exception:
                 log.exception("request failed")
-                self._send(200, {"say": "", "action": "none", "error": "internal"})
+                self._send(200, {**ERROR_REPLY, "error": "internal"})
 
         def log_message(self, fmt, *args):
             pass
@@ -511,16 +738,39 @@ def watch_parent(pid: int) -> None:
             pass
 
 
+def make_engine(cfg: Settings, args):
+    if cfg.voice in ("ruslan", "denis", "dmitri"):
+        return voice.PiperEngine(VOICES_DIR / f"ru_RU-{cfg.voice}-medium.onnx", args.pitch)
+    return voice.SileroEngine(VOICES_DIR / "silero_v5_ru.pt", cfg.voice, cfg.tone, cfg.tempo)
+
+
 def load_voice(brain: Brain, session: VoiceSession, args) -> None:
+    lock = threading.Lock()
+
+    def reload(cfg: Settings) -> None:
+        # Новый голос из настроек: собираем движок в фоне, старый говорит, пока новый не готов
+        with lock:
+            try:
+                engine = make_engine(cfg, args)
+                if brain.speaker:
+                    brain.speaker.set_engine(engine)
+                else:
+                    brain.speaker = voice.Speaker(engine, volume=cfg.volume, mute=args.mute)
+                log.info("голос сменён: %s (%s, %s)", cfg.voice, cfg.tone, cfg.tempo)
+            except Exception:
+                log.exception("голос %s не загрузился", cfg.voice)
+
+    loaded = brain.cfg
     if not args.no_tts:
         try:
-            if args.voice in ("ruslan", "denis", "dmitri"):
-                engine = voice.PiperEngine(VOICES_DIR / f"ru_RU-{args.voice}-medium.onnx", args.pitch)
-            else:
-                engine = voice.SileroEngine(VOICES_DIR / "silero_v5_ru.pt", args.voice, args.silero_pitch, args.silero_tempo)
-            brain.speaker = voice.Speaker(engine, volume=args.volume, mute=args.mute)
+            brain.speaker = voice.Speaker(make_engine(loaded, args), volume=loaded.volume, mute=args.mute)
         except Exception:
             log.exception("TTS не загрузился — компаньон будет только писать")
+    # Пока голос грузился, игра могла прислать другие настройки голоса
+    brain.voice_loader = reload
+    now = brain.cfg
+    if (now.voice, now.tone, now.tempo) != (loaded.voice, loaded.tone, loaded.tempo) or (now.tts and brain.speaker is None):
+        reload(now)
     session.load(args.stt_model, Path(args.fake_mic) if args.fake_mic else None, args.stt_device)
 
 
@@ -544,6 +794,9 @@ def main() -> None:
     parser.add_argument("--stt-device", default="cpu", choices=["gpu", "cpu"])
     parser.add_argument("--fake-mic", help="каталог с wav вместо микрофона (тесты)")
     parser.add_argument("--selftest", help="один запрос из командной строки без сервера")
+    parser.add_argument("--config", help="JSON с настройками характера (роль, длина ответов, мышление…)")
+    parser.add_argument("--memory-dir", help="другая папка для памяти (тесты)")
+    parser.add_argument("--state", help="JSON со сводкой обстановки для --selftest")
     args = parser.parse_args()
 
     DATA_DIR.mkdir(exist_ok=True)
@@ -554,14 +807,24 @@ def main() -> None:
     for noisy in ("httpx", "httpx2", "anthropic"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    brain = Brain(args.name, persist=not args.selftest)
-    brain.fillers = not args.no_fillers
+    cfg = Settings(name=args.name, voice=args.voice, tone=args.silero_pitch, tempo=args.silero_tempo,
+                   volume=args.volume, tts=not args.no_tts, fillers=not args.no_fillers)
+    if args.config:
+        # Настройки характера при запуске; дальше мод присылает их через /v1/config
+        try:
+            changes = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            cfg = Settings(**{**asdict(cfg), **{k: v for k, v in changes.items() if k in asdict(cfg)}})
+        except (OSError, ValueError, TypeError):
+            log.exception("настройки из %s не прочитались", args.config)
+    brain = Brain(cfg, persist=not args.selftest, memory_dir=Path(args.memory_dir) if args.memory_dir else None)
     session = VoiceSession(brain)
 
     if args.selftest:
         state = {"player_name": "Varg", "day": 3, "time_of_day": "вечер", "biome": "Луга",
                  "player_hp": 60, "player_hp_max": 100, "companion_hp": 250, "companion_hp_max": 250,
                  "trees_near": 12, "rocks_near": 3}
+        if args.state:
+            state.update(json.loads(Path(args.state).read_text(encoding="utf-8")))
         reply = brain.respond("chat", args.selftest, state, speak=False)
         print(json.dumps(reply.model_dump(), ensure_ascii=False))
         return
@@ -572,7 +835,7 @@ def main() -> None:
     threading.Thread(target=load_voice, args=(brain, session, args), daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(brain, session))
-    log.info("bridge listening on 127.0.0.1:%d, model %s, name %s", args.port, MODEL, args.name)
+    log.info("bridge listening on 127.0.0.1:%d, model %s, name %s", args.port, cfg.model()[0], cfg.name)
     server.serve_forever()
 
 
